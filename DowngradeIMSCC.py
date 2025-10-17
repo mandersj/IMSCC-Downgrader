@@ -1430,6 +1430,13 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
             save_manifest(tree, manifest_path)
             print(f"[EXCLUDE] dropped resources -> " +
                   ", ".join(f"{k}:{v}" for k,v in dropped.items() if v))
+            
+    # 7c) Exclude specific hrefs if requested
+    if args.exclude_href:
+        removed_n = drop_resources_by_href(tree, tmp, args.exclude_href)
+        if removed_n:
+            save_manifest(tree, manifest_path)
+            print(f"[EXCLUDE] removed resources by href match: {removed_n}")
     
     # 8) Remove items and dependencies referring to deleted resources
     if removed_any:
@@ -1771,6 +1778,8 @@ def main():
     parser.add_argument('--tf-to-mc-fallback', action='store_true',
     help="If a True/False item can't be normalized, convert it to a 2-option Multiple Choice.")
     parser.add_argument('--exclude', type=str, default='', help="Comma-separated kinds to drop instead of converting. " "Supported kinds: qti, webcontent, discussion, weblink, file, page")
+    parser.add_argument('--exclude-href', action='append', default=[],
+    help='Exact href or path suffix to remove (may be repeated). Example: --exclude-href web_resources/Uploaded%20Media/EItAcdPP-kk%281%29.jpg')
     args = parser.parse_args()
     exclude_kinds = {k.strip().lower() for k in (args.exclude.split(',') if args.exclude else []) if k.strip()}
 
@@ -1810,3 +1819,51 @@ def iter_all_qti_files(extracted_dir: Path):
     for p in extracted_dir.rglob('non_cc_assessments/*.xml.qti'):
         yield p
 
+def drop_resources_by_href(tree: ET.ElementTree, tmp: Path, href_terms: list[str]) -> int:
+    """
+    Remove any <resource> whose @href or any <file href> exactly matches one of the given strings,
+    OR ends with one of them (suffix match). Prunes org <item> refs and <dependency> refs as well.
+    """
+    if not href_terms: return 0
+    terms = [t.strip() for t in href_terms if t and t.strip()]
+    root = tree.getroot()
+    resources_parent = root.find('.//{*}resources')
+    if resources_parent is None: return 0
+
+    def match(h: str) -> bool:
+        if not h: return False
+        return any(h == t or h.endswith(t) for t in terms)
+
+    to_remove_ids = set()
+    for res in list(resources_parent.findall('{*}resource')):
+        href = (res.get('href') or '').strip()
+        files = [ (f.get('href') or '').strip() for f in res.findall('{*}file') ]
+        if match(href) or any(match(fh) for fh in files):
+            to_remove_ids.add(res.get('identifier') or 'UNKNOWN')
+
+    if not to_remove_ids: return 0
+
+    # remove resources
+    for res in list(resources_parent.findall('{*}resource')):
+        if (res.get('identifier') or '') in to_remove_ids:
+            resources_parent.remove(res)
+
+    # prune org items
+    for org in root.findall('.//{*}organization'):
+        for parent in list(org.iter()):
+            for child in list(parent):
+                if child.tag.endswith('item') and (child.get('identifierref') in to_remove_ids):
+                    parent.remove(child)
+
+    # prune dependencies
+    for res in root.findall('.//{*}resource'):
+        for dep in list(res.findall('{*}dependency')):
+            if dep.get('identifierref') in to_remove_ids:
+                res.remove(dep)
+
+    # also try to delete the files from the payload
+    for rid in to_remove_ids:
+        # best-effort: remove all files under a folder named like the resource href’s dir
+        pass  # (optional—generally safe to leave files; Moodle ignores unreferenced payload)
+
+    return len(to_remove_ids)
