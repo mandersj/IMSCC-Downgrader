@@ -703,34 +703,24 @@ def patch_descriptor_xmls(root_folder: Path, log: "ChangeLog") -> None:
                 # Non-fatal; leave file as-is
                 pass
 
-def dedupe_encoded_vs_decoded(root: Path) -> int:
-    """
-    Remove decoded/literal-space or double-encoded duplicates when an encoded twin exists.
-    Returns the number of files removed.
-    """
+def dedupe_keep_decoded(root: Path) -> int:
     removed = 0
-    seen_encoded = set()
-    # First collect encoded canonical targets
-    for p in root.rglob("*"):
-        if p.is_file():
-            rel = "/".join(p.relative_to(root).parts)
-            if rel != canonicalize_href(rel):
-                continue
-            seen_encoded.add(rel)
-
-    # Now scan again for non-encoded and remove if an encoded twin exists
-    for p in root.rglob("*"):
+    for p in list(root.rglob("*")):
         if not p.is_file():
             continue
         rel = "/".join(p.relative_to(root).parts)
-        enc_rel = canonicalize_href(rel)
-        if enc_rel != rel and enc_rel in seen_encoded:
+        enc = urllib.parse.quote(urllib.parse.unquote(rel), safe="/-_.~")
+        dec = urllib.parse.unquote(enc)
+        enc_abs = root / enc
+        dec_abs = root / dec
+        if enc_abs != dec_abs and enc_abs.exists() and dec_abs.exists():
             try:
-                p.unlink()
+                enc_abs.unlink()
                 removed += 1
             except Exception:
                 pass
     return removed
+
 
 def rezip_folder(src_folder: Path, dest_zip: Path) -> None:
     dest_zip = dest_zip.with_suffix('.imscc')
@@ -1620,8 +1610,8 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
 
     def normalize_resource_hrefs(tree: ET.ElementTree, tmp: Path) -> tuple[int, int]:
         """
-        URL-encode resource hrefs (spaces, etc.) and ensure encoded copies exist on disk.
-        Also align <file href> to the encoded value.
+        Canonicalize *all* resource hrefs to URL-encoded form and ensure the encoded file exists.
+        Align the single <file href> to match. This hits images, PDFs, zips, etc.
         """
         changed_href = 0
         created_files = 0
@@ -1632,54 +1622,130 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
             if not href:
                 continue
 
-            # Only bother for HTML-ish or webcontent-ish
-            rtype = (res.get("type") or "").lower()
-            is_htmlish = href.lower().endswith((".html", ".htm")) or "webcontent" in rtype
-
-            if not is_htmlish:
-                continue
-
+            # Canonical encoded target
             enc = urllib.parse.quote(urllib.parse.unquote(href), safe="/-_.~")
             if enc != href:
-                # point manifest to encoded path
                 res.set("href", enc)
                 changed_href += 1
 
-            src = tmp / href
             dst = tmp / enc
             if not dst.exists():
-                ensure_parent_dir(dst)
-                if src.exists() and src.is_file():
-                    if os.path.abspath(src) != os.path.abspath(dst):
-                        dst.write_bytes(src.read_bytes())
+                # Try plausible source variants
+                candidates = [
+                    tmp / urllib.parse.unquote(href),  # decoded of original
+                    tmp / href,                        # original as-is
+                    tmp / urllib.parse.unquote(enc),   # decoded of encoded
+                ]
+                for src in candidates:
+                    try:
+                        if src.exists() and src.is_file():
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            if os.path.abspath(src) != os.path.abspath(dst):
+                                shutil.copy2(str(src), str(dst))
+                            created_files += 1
+                            break
+                    except Exception:
+                        # fallthrough to try next candidate
+                        pass
                 else:
+                    # As a last resort, create a tiny placeholder (rare)
+                    dst.parent.mkdir(parents=True, exist_ok=True)
                     dst.write_text(
                         f"<html><body><p>Auto-generated placeholder for missing target: "
                         f"<code>{enc}</code></p></body></html>",
                         encoding="utf-8",
                     )
-                created_files += 1
+                    created_files += 1
 
-            # Align <file> child to the encoded href (single file entry)
+            # Align a single <file href> child to the encoded href
             f = res.find("{*}file")
             if f is None:
                 f = ET.SubElement(res, "{http://www.imsglobal.org/xsd/imscp_v1p1}file")
             f.set("href", enc)
 
-            # Remove any extra <file> children that don't match the encoded href
+            # Remove any extra <file> elements that don't match the encoded href
             for extra in list(res.findall("{*}file")):
                 if extra is not f and (extra.get("href") or "").strip() != enc:
                     res.remove(extra)
 
         return changed_href, created_files
 
+    def enforce_decoded_payload(tree: ET.ElementTree, tmp: Path) -> tuple[int,int,int]:
+        """
+        Ensure every referenced resource exists on disk at its *decoded* path.
+        - If only encoded exists -> move to decoded.
+        - If both exist -> delete encoded, keep decoded.
+        - If neither exists -> create a small placeholder at decoded.
+        Returns (moved_enc_to_dec, removed_encoded_dupes, created_placeholders).
+        """
+        moved = removed = created = 0
+        root = tree.getroot()
+
+        # Helper to normalize any href-like string
+        def enc_and_dec(rel: str) -> tuple[Path, Path, str, str]:
+            rel = (rel or "").strip()
+            enc = urllib.parse.quote(urllib.parse.unquote(rel), safe="/-_.~")
+            dec = urllib.parse.unquote(enc)
+            return (tmp / enc, tmp / dec, enc, dec)
+
+        # Walk both <resource href> and <file href> to cover everything we reference
+        hrefs: set[str] = set()
+        for res in root.findall(".//{*}resource"):
+            h = (res.get("href") or "").strip()
+            if h:
+                hrefs.add(h)
+            for f in res.findall("{*}file"):
+                fh = (f.get("href") or "").strip()
+                if fh:
+                    hrefs.add(fh)
+
+        for h in sorted(hrefs):
+            enc_abs, dec_abs, enc, dec = enc_and_dec(h)
+
+            # Case 1: encoded exists, decoded missing -> move (rename) encoded -> decoded
+            if enc_abs.exists() and not dec_abs.exists():
+                dec_abs.parent.mkdir(parents=True, exist_ok=True)
+                # Use move if same filesystem; copy+unlink otherwise (Path.rename throws across FS)
+                try:
+                    enc_abs.rename(dec_abs)
+                except Exception:
+                    shutil.copy2(str(enc_abs), str(dec_abs))
+                    try:
+                        enc_abs.unlink()
+                    except Exception:
+                        pass
+                moved += 1
+                continue
+
+            # Case 2: both exist -> delete the encoded duplicate
+            if enc_abs.exists() and dec_abs.exists():
+                try:
+                    enc_abs.unlink()
+                    removed += 1
+                except Exception:
+                    pass
+                continue
+
+            # Case 3: neither exists -> create placeholder at decoded
+            if not enc_abs.exists() and not dec_abs.exists():
+                dec_abs.parent.mkdir(parents=True, exist_ok=True)
+                dec_abs.write_text(
+                    f"<html><body><p>Auto-generated placeholder for missing asset: "
+                    f"<code>{dec}</code></p></body></html>",
+                    encoding="utf-8",
+                )
+                created += 1
+
+        return moved, removed, created
+
     href_updates, copies = normalize_resource_hrefs(tree, tmp)
-    if href_updates or copies:
-        print(f"[ENCODE] hrefs updated: {href_updates}, files created/copied: {copies}")
+    moved, removed, created = enforce_decoded_payload(tree, tmp)
+    if href_updates or copies or moved or removed or created:
+        print(f"[PAYLOAD] moved enc→dec: {moved}, removed enc dupes: {removed}, created decoded placeholders: {created}")
         save_manifest(tree, manifest_path)
     
     # 14a) Just before rezip
-    _ = dedupe_encoded_vs_decoded(tmp)
+    _ = dedupe_keep_decoded(tmp)
     
     # 14b) Write output zip (.imscc)
     out_name = input_zip.stem + '-cc11.imscc'
