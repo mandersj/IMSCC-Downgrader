@@ -903,7 +903,221 @@ def audit_qti_resources(root_folder: Path, tree: ET.ElementTree, log: "ChangeLog
             titles = "; ".join(sorted(res_id_to_titles.get(rid, []))) or None
             log.qti_audit.append((rid, titles, classification, note))
 
-            
+def fix_qti_resource_hrefs(tree: ET.ElementTree, base_folder: Path) -> int:
+    """
+    For each QTI assessment resource, if @href is missing/null but a
+    <file href=".../assessment_qti.xml"> exists, set href to that file.
+    Returns number of resources patched.
+    """
+    root = tree.getroot()
+    patched = 0
+    for res in root.findall('.//{*}resource'):
+        rtype = (res.get('type') or '').lower()
+        if 'imsqti_xml' not in rtype:           # only QTI assessment resources
+            continue
+        href = res.get('href')
+        if href:                                 # already good
+            continue
+        # find a candidate assessment_qti.xml file entry
+        files = res.findall('{*}file')
+        cand = None
+        for f in files:
+            fh = (f.get('href') or '')
+            if fh.endswith('/assessment_qti.xml'):
+                cand = fh
+                break
+        if cand:
+            res.set('href', cand)
+            patched += 1
+    return patched
+
+def audit_qti_assessment_items(root_folder: Path, tree: ET.ElementTree) -> None:
+    """
+    Print a warning if any assessment_qti.xml has zero <item> nodes.
+    Non-fatal; helps pinpoint upstream bad exports.
+    """
+    root = tree.getroot()
+    for res in root.findall('.//{*}resource'):
+        rtype = (res.get('type') or '').lower()
+        if 'imsqti_xml' not in rtype:
+            continue
+        href = res.get('href') or ''
+        if not href:
+            continue
+        xmlp = (root_folder / href)
+        if not xmlp.exists():
+            print(f"[QTI-WARN] missing assessment file: {xmlp}")
+            continue
+        try:
+            txt = xmlp.read_text(encoding='utf-8', errors='ignore')
+            r = ET.fromstring(txt)
+            n_items = len(r.findall('.//{*}item'))
+            if n_items == 0:
+                rid = res.get('identifier') or 'UNKNOWN_RESOURCE_ID'
+                print(f"[QTI-WARN] assessment has 0 items: resource={rid} file={href}")
+        except Exception as e:
+            print(f"[QTI-WARN] parse failed for {href}: {e}")
+
+def _qti_item_count(xml_path: Path) -> int:
+    try:
+        txt = xml_path.read_text(encoding='utf-8', errors='ignore')
+        root = ET.fromstring(txt)
+    except Exception:
+        return 0
+    return len(root.findall('.//{*}item'))
+
+
+def remove_empty_qti_assessments(tree: ET.ElementTree, base_folder: Path) -> int:
+    """
+    Remove QTI resources whose resolved assessment_qti.xml contains zero <item>.
+    Also prunes <item> nodes in <organizations> and <dependency> refs to those resources.
+    Returns count removed.
+    """
+    root = tree.getroot()
+    resources_parent = root.find('.//{*}resources')
+    if resources_parent is None:
+        return 0
+
+    # 1) Find empty QTI resources
+    empty_ids = set()
+    for res in list(resources_parent.findall('{*}resource')):
+        rtype = (res.get('type') or '').lower()
+        if 'imsqti' not in rtype:  # only QTI assessments
+            continue
+        href = res.get('href') or ''
+        if not href:
+            continue
+        xmlp = base_folder / href
+        if not xmlp.exists():
+            # Missing file is equivalent to empty for import purposes
+            empty_ids.add(res.get('identifier') or 'UNKNOWN')
+            continue
+        if _qti_item_count(xmlp) == 0:
+            empty_ids.add(res.get('identifier') or 'UNKNOWN')
+
+    if not empty_ids:
+        return 0
+
+    # 2) Remove those resources
+    for res in list(resources_parent.findall('{*}resource')):
+        if (res.get('identifier') or '') in empty_ids:
+            resources_parent.remove(res)
+
+    # 3) Prune org <item> entries that reference them
+    for org in root.findall('.//{*}organization'):
+        for it in list(org.findall('.//{*}item')):
+            if (it.get('identifierref') or '') in empty_ids:
+                parent = it.getparent() if hasattr(it, 'getparent') else None  # ElementTree lacks getparent
+                # fallback: manual search
+                if parent is None:
+                    # brute-force: walk children to find and remove
+                    for p in list(org.iter()):
+                        for c in list(p):
+                            if c is it:
+                                p.remove(c)
+                                break
+                else:
+                    parent.remove(it)
+
+    # 4) Prune <dependency> links to removed resources
+    for res in root.findall('.//{*}resource'):
+        for dep in list(res.findall('{*}dependency')):
+            if (dep.get('identifierref') or '') in empty_ids:
+                res.remove(dep)
+
+    return len(empty_ids)      
+
+def sanitize_webcontent_resources(tree: ET.ElementTree, base_folder: Path) -> Tuple[int, int]:
+    """
+    Ensure every webcontent resource points to a real, non-empty HTML file.
+    - If href is missing -> remove the resource and prune references.
+    - If href file is missing or empty/whitespace -> create a small placeholder HTML and repoint.
+    Returns (removed_count, patched_count).
+    """
+    root = tree.getroot()
+    resources_parent = root.find('.//{*}resources')
+    if resources_parent is None:
+        return (0, 0)
+
+    removed, patched = 0, 0
+    removed_ids: Set[str] = set()
+
+    def prune_refs(to_remove: Set[str]) -> None:
+        # prune <item> in organizations
+        for org in root.findall('.//{*}organization'):
+            for parent in list(org.iter()):
+                for child in list(parent):
+                    if child.tag.endswith('item') and (child.get('identifierref') in to_remove):
+                        parent.remove(child)
+        # prune <dependency>
+        for res in root.findall('.//{*}resource'):
+            for dep in list(res.findall('{*}dependency')):
+                if dep.get('identifierref') in to_remove:
+                    res.remove(dep)
+
+    for res in list(resources_parent.findall('{*}resource')):
+        rtype = (res.get('type') or '').lower()
+        is_webcontent = (
+            'webcontent' in rtype
+            or 'learning-application-resource' in rtype
+            or 'imscc_xmlv1p1/learning-application-resource' in rtype
+            or rtype.strip() == 'associatedcontent/imscc_xmlv1p1/learning-application-resource'
+        )
+        if not is_webcontent:
+            continue
+        rid = res.get('identifier') or 'UNKNOWN_RESOURCE_ID'
+        href = res.get('href')
+
+        if not href:
+            # No target at all → remove
+            resources_parent.remove(res)
+            removed_ids.add(rid)
+            removed += 1
+            continue
+
+        target = (base_folder / href)
+        data = ''
+        if target.exists():
+            try:
+                data = target.read_text(encoding='utf-8', errors='ignore')
+            except Exception:
+                data = ''
+
+        if (not target.exists()) or (len(data.strip()) == 0):
+            # create a minimal placeholder and repoint if needed
+            # keep it near original path when possible
+            dst = target
+            if not target.parent.exists():
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+            # if target path is a folder or weird, park under a safe path
+            if target.is_dir() or target.suffix.lower() not in {'.html', '.htm'}:
+                dst = base_folder / f"{rid}_placeholder.html"
+                res.set('href', dst.relative_to(base_folder).as_posix())
+
+            placeholder = (
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<title>Content placeholder</title></head>"
+                "<body><p>This content was empty or missing in the source cartridge.</p></body></html>"
+            )
+            print(f"[MANIFEST] webcontent fix: {rid} -> {res.get('href') or href} (creating placeholder)")
+            try:
+                dst.write_text(placeholder, encoding='utf-8')
+                patched += 1
+            except Exception:
+                # If we can’t write, last resort: remove the resource
+                resources_parent.remove(res)
+                removed_ids.add(rid)
+                removed += 1
+
+    if removed_ids:
+        prune_refs(removed_ids)
+
+    return (removed, patched)
+
+
 def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool = False) -> Path:
     input_zip = input_zip.resolve()
     output_dir = output_dir.resolve()
@@ -977,6 +1191,27 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
     # 11b) Make IMSCP the default namespace and drop prefixes
     normalize_default_ns(tree)
     save_manifest(tree, manifest_path)
+
+    # 11c) Ensure QTI assessment resources have href -> assessment_qti.xml
+    patched = fix_qti_resource_hrefs(tree, tmp)
+    if patched:
+        save_manifest(tree, manifest_path)
+        print(f"[MANIFEST] patched QTI resource hrefs: {patched}")
+
+    # audit (optional)
+    audit_qti_assessment_items(tmp, tree)
+
+    # 11d) Remove assessments with 0 <item>
+    removed_empty = remove_empty_qti_assessments(tree, tmp)
+    if removed_empty:
+        save_manifest(tree, manifest_path)
+        print(f"[MANIFEST] removed empty QTI assessments: {removed_empty}")
+
+    # 11e) sanitize webcontent (prevents DOMDocument->loadHTML on empty)
+    wc_removed, wc_patched = sanitize_webcontent_resources(tree, tmp)
+    if wc_removed or wc_patched:
+        save_manifest(tree, manifest_path)
+        print(f"[MANIFEST] webcontent sanitized: removed={wc_removed}, patched={wc_patched}")
 
     # 12) Patch descriptor XMLs to reference v1p1 schemas instead of v1p2
     patch_descriptor_xmls(tmp, log)
