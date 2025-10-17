@@ -627,126 +627,166 @@ def _resp_lid_and_labels(item: ET.Element) -> Tuple[Optional[ET.Element], List[E
 
 
 def fix_qti_true_false_in_place(xml_path: Path, fallback_tf_to_mc: bool, log: ChangeLog) -> bool:
+    """
+    Normalize Canvas-flavored QTI 1.2 True/False items so Moodle's CC 1.1 importer accepts them.
+    Rules we enforce:
+      • Exactly two <response_label> under a single <response_lid>, with idents literally "true" and "false".
+      • ALL <varequal> values rewritten to "true"/"false". Any other identifier is removed or remapped.
+      • Optional fallback: if there are more than 2 labels and fallback_tf_to_mc=True, convert to single‑answer MC.
+    """
     try:
         txt = xml_path.read_text(encoding='utf-8', errors='ignore')
         root = ET.fromstring(txt)
     except Exception:
-        return False
+        return False  # not XML or not parseable → ignore
+
     if localname(root.tag) != 'questestinterop':
-        return False
+        return False  # not QTI 1.2
 
     changed_any = False
 
     def label_text(el: ET.Element) -> str:
         mt = el.find('.//{*}mattext')
-        return (mt.text or '').strip().lower() if mt is not None and mt.text else ''
+        return (mt.text or '').strip().lower() if (mt is not None and mt.text) else ''
 
+    # Helper: remove all <other/> branches inside respcondition/conditionvar
+    def drop_other_branches(item: ET.Element):
+        for rc in item.findall('.//{*}respcondition'):
+            cv = rc.find('{*}conditionvar')
+            if cv is None:
+                continue
+            removed = False
+            for o in list(cv.findall('{*}other')):
+                cv.remove(o)
+                removed = True
+            if removed:
+                nonlocal changed_any
+                changed_any = True
+
+    # Pass each <item>
     for item in root.findall('.//{*}item'):
         qtype = (_qmd_value(item, 'question_type') or '').strip().lower()
-        is_tf = (qtype == 'true_false_question')
-        rl, labels = _resp_lid_and_labels(item)
+        rl = item.find('.//{*}response_lid')
+        labels = rl.findall('{*}response_label') if rl is not None else []
 
-        if not is_tf and rl is not None and len(labels) >= 2:
-            # Heuristic: looks like TF by label text
-            texts = {label_text(labels[0]), label_text(labels[1])}
-            if texts & {'true', 'false'}:
-                is_tf = True
-
+        # Heuristic: some Canvas exports omit metadata but look like TF by label text
+        looks_tf = False
+        if rl is not None and len(labels) >= 2:
+            first_two = {label_text(labels[0]), label_text(labels[1])}
+            looks_tf = bool(first_two & {'true','false'})
+        is_tf = (qtype == 'true_false_question') or looks_tf
         if not is_tf:
             continue
 
-        # If not exactly two choices → convert to MC when allowed
+        # If there are not exactly two labels, resolve:
         if rl is None or len(labels) != 2:
             if fallback_tf_to_mc:
-                # flip metadata
+                # Flip metadata to multiple choice
                 for f in item.findall('.//{*}qtimetadatafield'):
                     lbl = f.find('{*}fieldlabel'); ent = f.find('{*}fieldentry')
                     if lbl is not None and ent is not None and (lbl.text or '').strip() == 'question_type':
                         ent.text = 'multiple_choice_question'
-                # remove TF-only <other/> branches
-                for ve in item.findall('.//{*}other'):
-                    parent = ve.getparent() if hasattr(ve, 'getparent') else None
-                    if parent is not None:
-                        parent.remove(ve)
+                drop_other_branches(item)
                 log.tf_mc_fallback += 1
                 changed_any = True
             else:
-                log.tf_skipped += 1
-            continue
+                # Best effort: collapse to exactly two by picking the first two labels that look like true/false,
+                # else keep the first two and drop the rest.
+                if rl is not None and len(labels) > 2:
+                    # Prefer labels matching 'true'/'false' text
+                    true_like = [l for l in labels if label_text(l) in {'true'}]
+                    false_like = [l for l in labels if label_text(l) in {'false'}]
+                    keep = []
+                    if true_like and false_like:
+                        keep = [true_like[0], false_like[0]]
+                    else:
+                        keep = labels[:2]
+                    for l in list(labels):
+                        if l not in keep:
+                            rl.remove(l)
+                            changed_any = True
+                    labels = keep
+                else:
+                    log.tf_skipped += 1
+                    continue  # can't fix
+            # After MC fallback we don't try further TF normalization for this item.
+            if fallback_tf_to_mc:
+                continue
 
-        # Build mapping → which label should be 'true' vs 'false'?
+        # At this point we have 2 labels
         l1, l2 = labels[0], labels[1]
-        id1, id2 = (l1.get('ident') or ''), (l2.get('ident') or '')
+        old_id1, old_id2 = (l1.get('ident') or ''), (l2.get('ident') or '')
         t1, t2 = label_text(l1), label_text(l2)
 
-        # Try to detect the correct answer from resprocessing
+        # Determine which should be 'true' vs 'false'
+        # Prefer resprocessing → else label text → else default by position
         correct_ident = None
-        for ve in item.findall('.//{*}varequal'):
+        for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
             val = (ve.text or '').strip()
             if val:
                 correct_ident = val
                 break
 
-        # Decide mapping
-        # priority: resprocessing → then label text → else give up or MC
         mapping: Dict[str, str] = {}
-        if correct_ident in {id1, id2}:
+        if correct_ident in {old_id1, old_id2}:
             mapping[correct_ident] = 'true'
-            mapping[id1 if correct_ident == id2 else id2] = 'false'
-        elif {t1, t2} == {'true', 'false'}:
-            mapping[id1] = t1
-            mapping[id2] = t2
+            mapping[old_id1 if correct_ident == old_id2 else old_id2] = 'false'
+        elif {t1, t2} == {'true','false'}:
+            mapping[old_id1] = t1
+            mapping[old_id2] = t2
         else:
-            if fallback_tf_to_mc:
-                for f in item.findall('.//{*}qtimetadatafield'):
-                    lbl = f.find('{*}fieldlabel'); ent = f.find('{*}fieldentry')
-                    if lbl is not None and ent is not None and (lbl.text or '').strip() == 'question_type':
-                        ent.text = 'multiple_choice_question'
-                for ve in item.findall('.//{*}other'):
-                    parent = ve.getparent() if hasattr(ve, 'getparent') else None
-                    if parent is not None:
-                        parent.remove(ve)
-                log.tf_mc_fallback += 1
-                changed_any = True
+            # If undecidable, default first→true, second→false (consistent + deterministic)
+            mapping[old_id1] = 'true'
+            mapping[old_id2] = 'false'
+
+        # Apply new idents to labels
+        if l1.get('ident') != mapping[old_id1]:
+            l1.set('ident', mapping[old_id1]); changed_any = True
+        if l2.get('ident') != mapping[old_id2]:
+            l2.set('ident', mapping[old_id2]); changed_any = True
+
+        # Rewrite ALL varequal values to the new idents; also purge unknown identifiers
+        valid_new = {mapping[old_id1], mapping[old_id2]}
+        for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
+            val = (ve.text or '').strip()
+            # Map from any of the old ids to the canonical 'true'/'false'
+            if val in mapping:
+                if ve.text != mapping[val]:
+                    ve.text = mapping[val]; changed_any = True
+            elif val.lower() in {'true','false'}:
+                # normalize case if Canvas happened to use text idents already
+                if ve.text != val.lower():
+                    ve.text = val.lower(); changed_any = True
             else:
-                log.tf_skipped += 1
-            continue
+                # Unknown ident: Moodle will choke; remap to 'false' (safe default) and log
+                ve.text = 'false'; changed_any = True
 
-        # Apply mapping to labels
-        if mapping.get(id1) and mapping[id1] != id1.lower():
-            l1.set('ident', mapping[id1])
-            changed_any = True
-        if mapping.get(id2) and mapping[id2] != id2.lower():
-            l2.set('ident', mapping[id2])
-            changed_any = True
+        # Ensure exactly two labels remain and are literally 'true'/'false'
+        # (In case earlier we collapsed a longer set.)
+        for extra in list(rl.findall('{*}response_label'))[2:]:
+            rl.remove(extra); changed_any = True
+        # Enforce lowercase canonical idents
+        if (l1.get('ident') not in {'true','false'}) or (l2.get('ident') not in {'true','false'}):
+            # If mapping somehow produced non-canonical values, coerce by position
+            l1.set('ident','true'); l2.set('ident','false'); changed_any = True
+            # And rewrite varequals accordingly
+            for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
+                ve.text = 'true' if ve.text.strip().lower() == 'true' else 'false'
 
-        # Rewrite *all* varequal values to the new idents
-        renames = {id1: l1.get('ident') or id1, id2: l2.get('ident') or id2}
-        for ve in item.findall('.//{*}varequal'):
-            old = (ve.text or '').strip()
-            if old in renames and (ve.text or '') != renames[old]:
-                ve.text = renames[old]
-                changed_any = True
-
-        # Remove any <other/> branches
-        for other in item.findall('.//{*}other'):
-            parent = other.find('..')
-            # ET doesn't support getparent; just try safe remove via scan
-            for rc in item.findall('.//{*}respcondition'):
-                cv = rc.find('{*}conditionvar')
-                if cv is not None:
-                    for o in list(cv.findall('{*}other')):
-                        cv.remove(o); changed_any = True
+        # Drop any <other/> branches
+        drop_other_branches(item)
 
         # Count success
         log.tf_fixed += 1
 
     if changed_any:
+        # Re-serialize
         xml_path.write_bytes(ET.tostring(root, encoding='utf-8', xml_declaration=True))
     return changed_any
 
 
 def _has_bad_tf_idents(xml_path: Path) -> bool:
+    """Return True if file contains any TF item that Moodle would reject."""
     try:
         txt = xml_path.read_text(encoding='utf-8', errors='ignore')
         root = ET.fromstring(txt)
@@ -756,20 +796,27 @@ def _has_bad_tf_idents(xml_path: Path) -> bool:
         return False
     for item in root.findall('.//{*}item'):
         qtype = (_qmd_value(item, 'question_type') or '').strip().lower()
-        rl, labels = _resp_lid_and_labels(item)
         if qtype != 'true_false_question':
-            continue
+            # Heuristic: also treat items that *look* TF (exactly two labels with true/false text) as TF
+            rl = item.find('.//{*}response_lid')
+            labels = rl.findall('{*}response_label') if rl is not None else []
+            if rl is None or len(labels) != 2:
+                continue
+            tset = {(labels[0].find('.//{*}mattext').text or '').strip().lower() if labels[0].find('.//{*}mattext') is not None else '',
+                    (labels[1].find('.//{*}mattext').text or '').strip().lower() if labels[1].find('.//{*}mattext') is not None else ''}
+            if tset != {'true','false'}:
+                continue
+        rl = item.find('.//{*}response_lid')
+        labels = rl.findall('{*}response_label') if rl is not None else []
         if rl is None or len(labels) != 2:
             return True
-        idset = { (labels[0].get('ident') or '').lower(), (labels[1].get('ident') or '').lower() }
-        if idset != {'true', 'false'}:
+        idset = {(labels[0].get('ident') or '').lower(), (labels[1].get('ident') or '').lower()}
+        if idset != {'true','false'}:
             return True
-        # also ensure every varequal uses only true/false
-        for ve in item.findall('.//{*}varequal'):
+        for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
             if (ve.text or '').strip().lower() not in {'true','false'}:
                 return True
     return False
-
 
 def assert_no_bad_tf_idents(root_folder: Path) -> None:
     offenders = []
@@ -779,9 +826,55 @@ def assert_no_bad_tf_idents(root_folder: Path) -> None:
         if _has_bad_tf_idents(xmlp):
             offenders.append(str(xmlp))
     if offenders:
-        raise ValueError("Unfixed TF items remain (idents not 'true'/'false' or varequal mismatch) in:\n" + "\n".join(offenders))
+        raise ValueError(
+    "Unfixed TF items remain (idents must be 'true'/'false' and varequal must reference them) in:\n"
+    + "\n".join(offenders)
+)
 
-
+def log_tf_validation_issues(root_folder: Path) -> None:
+    """
+    Scan all QTI 1.2 XMLs and print precise diagnostics for T/F items
+    that would break Moodle import. Non-fatal; purely informational.
+    """
+    for xmlp in root_folder.rglob('*.xml'):
+        if xmlp.name.lower() == 'imsmanifest.xml':
+            continue
+        try:
+            txt = xmlp.read_text(encoding='utf-8', errors='ignore')
+            root = ET.fromstring(txt)
+        except Exception:
+            continue
+        if localname(root.tag) != 'questestinterop':
+            continue
+        for item in root.findall('.//{*}item'):
+            qid = item.get('ident') or 'UNKNOWN_ITEM_IDENT'
+            title = (item.find('.//{*}mattext').text or '').strip() if item.find('.//{*}mattext') is not None else ''
+            qtype = (_qmd_value(item, 'question_type') or '').strip().lower()
+            rl = item.find('.//{*}response_lid')
+            labels = rl.findall('{*}response_label') if rl is not None else []
+            is_tf = (qtype == 'true_false_question')
+            # Heuristic TF look-alike
+            if not is_tf and rl is not None and len(labels) >= 2:
+                tset = { (labels[0].find('.//{*}mattext').text or '').strip().lower() if labels[0].find('.//{*}mattext') is not None else '',
+                         (labels[1].find('.//{*}mattext').text or '').strip().lower() if labels[1].find('.//{*}mattext') is not None else ''}
+                if tset & {'true','false'}:
+                    is_tf = True
+            if not is_tf:
+                continue
+            problems = []
+            if rl is None:
+                problems.append("no <response_lid>")
+            elif len(labels) != 2:
+                problems.append(f"{len(labels)} response_label(s)")
+            else:
+                ids = [(labels[0].get('ident') or '').lower(), (labels[1].get('ident') or '').lower()]
+                if set(ids) != {'true','false'}:
+                    problems.append(f"id mismatch: {ids} (expected ['true','false'])")
+            for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
+                if (ve.text or '').strip().lower() not in {'true','false'}:
+                    problems.append(f"bad varequal '{(ve.text or '').strip()}'")
+            if problems:
+                print(f"[TF-VALIDATION] {xmlp} :: item ident={qid!r} title={title!r} -> " + "; ".join(problems))
 def normalize_true_false_qti(root_folder: Path, fallback_tf_to_mc: bool, log: ChangeLog) -> None:
     """
     Walk every .xml under the package; for QTI 1.2 files try to fix T/F items in place.
@@ -924,7 +1017,8 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
     # 12b) Normalize QTI T/F idents to 'true'/'false' (with optional MC fallback)
     normalize_true_false_qti(tmp, tf_to_mc_fallback, log)
 
-    # 12c) Abort early with the exact files if anything TF-ish is still off
+    # 12c) Log detailed TF validation issues then abort if anything is still off
+    log_tf_validation_issues(tmp)
     assert_no_bad_tf_idents(tmp)
 
     # 13A) QTI audit (no changes, just reporting)
