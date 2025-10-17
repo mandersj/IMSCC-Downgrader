@@ -61,6 +61,58 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import zipfile
+
+def detect_canvas_qti_artifacts(manifest_path: Path, extracted_dir: Path):
+    """
+    Returns (should_force_qti: bool, reasons: list[str], qti_files: list[Path])
+    Heuristics:
+      - Any <file href="non_cc_assessments/*.xml.qti">
+      - Any CC 1.1 assessment with a <dependency> that points at a .xml.qti
+      - Presence of assessment_qti.xml files (we process them regardless)
+    """
+    reasons, qti_files = [], []
+
+    if not manifest_path.exists():
+        return False, ["no imsmanifest.xml found"], []
+
+    try:
+        root = ET.parse(manifest_path).getroot()
+    except Exception:
+        return False, ["imsmanifest.xml not parseable"], []
+
+    # 1) non_cc_assessments payloads
+    for f in root.findall('.//{*}file'):
+        href = f.get('href') or ''
+        if href.startswith('non_cc_assessments/') and href.endswith('.xml.qti'):
+            reasons.append(f'non_cc_assessments/{Path(href).name}')
+            qti_files.append(extracted_dir / href)
+
+    # 2) dependency chain into non_cc_assessments
+    for dep in root.findall('.//{*}dependency'):
+        ref = dep.get('identifierref')
+        if not ref:
+            continue
+        r = root.find(f".//{{*}}resource[@identifier='{ref}']")
+        if r is not None:
+            href = r.get('href') or ''
+            if href.startswith('non_cc_assessments/') and href.endswith('.xml.qti'):
+                reasons.append(f'dependency->{href}')
+                qti_files.append(extracted_dir / href)
+
+    # 3) standard assessment_qti.xml
+    for f in root.findall('.//{*}file'):
+        href = f.get('href') or ''
+        if href.endswith('/assessment_qti.xml'):
+            qti_files.append(extracted_dir / href)
+
+    # De-dupe + filter existing
+    uniq, seen = [], set()
+    for p in qti_files:
+        if p not in seen and p.exists():
+            seen.add(p); uniq.append(p)
+
+    should_force = len(reasons) > 0 or len(uniq) > 0
+    return should_force, reasons, uniq
 import xml.etree.ElementTree as ET
 
 # ---------------------------------------------------------------------------
@@ -273,47 +325,13 @@ def assert_no_v13_v12_uris(manifest_text: str) -> None:
     bad = re.findall(r'imsccv1p3|imscp_extensionv1p2|ccv1p3', manifest_text)
     if bad:
         raise ValueError(f"Leftover v1p3/v1p2 markers found: {set(bad)}")
-
-def rezip_folder(src_folder: Path, dest_zip: Path) -> None:
-    dest_zip = dest_zip.with_suffix('.imscc')
-    with zipfile.ZipFile(dest_zip, 'w', compression=zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(src_folder):
-            for fname in files:
-                fpath = Path(root) / fname
-                arcname = str(fpath.relative_to(src_folder))
-                z.write(fpath, arcname)
-
-
+        
 def load_manifest(manifest_path: Path) -> ET.ElementTree:
     return ET.parse(manifest_path)
-
 
 def save_manifest(tree: ET.ElementTree, manifest_path: Path) -> None:
     tree.write(manifest_path, encoding='utf-8', xml_declaration=True)
 
-
-def element_iter(el: ET.Element):
-    yield el
-    for child in list(el):
-        yield from element_iter(child)
-
-
-def iter_with_parent(el: ET.Element):
-    for child in list(el):
-        yield el, child
-        yield from iter_with_parent(child)
-        
-def drop_cp_variants(tree: ET.ElementTree) -> int:
-    """Remove any <variant> elements (CP extension) in the manifest."""
-    root = tree.getroot()
-    removed = 0
-    for parent in list(element_iter(root)):
-        for child in list(parent):
-            if localname(child.tag) == 'variant':
-                parent.remove(child)
-                removed += 1
-    return removed
-        
 def manifest_cc_version(tree: ET.ElementTree) -> Optional[str]:
     for sv in tree.getroot().findall('.//{*}schemaversion'):
         if sv.text:
@@ -322,16 +340,16 @@ def manifest_cc_version(tree: ET.ElementTree) -> Optional[str]:
 
 # ------------------ Manifest edits & pruning --------------------------------
 
-def prune_curriculum_standards(tree: ET.ElementTree, log: ChangeLog) -> None:
-    """Remove Curriculum Standards metadata based on namespace (safer than localname)."""
+def prune_curriculum_standards(tree: ET.ElementTree, log: "ChangeLog") -> None:
+    """Remove Curriculum Standards metadata by namespace (safer than tag match)."""
     root = tree.getroot()
     removed = 0
-    for parent in list(element_iter(root)):
+    for parent in list(root.iter()):
         for child in list(parent):
             tag = child.tag
             if tag.startswith('{'):
                 ns = tag.split('}', 1)[0].strip('{')
-                if CSM_HINT in ns:
+                if CSM_HINT in ns:  # e.g., 'imscsmd'
                     parent.remove(child)
                     removed += 1
     if removed:
@@ -339,19 +357,21 @@ def prune_curriculum_standards(tree: ET.ElementTree, log: ChangeLog) -> None:
 
 
 def build_res_id_to_item_titles(tree: ET.ElementTree) -> Dict[str, Set[str]]:
+    """Map <resource identifier> -> set of <item><title> strings from organizations."""
     root = tree.getroot()
-    mapping: Dict[str, Set[str]] = {}
+    m: Dict[str, Set[str]] = {}
     for org in root.findall('.//{*}organization'):
         for item in org.findall('.//{*}item'):
             rid = item.get('identifierref')
             title_el = item.find('{*}title')
-            title = title_el.text.strip() if title_el is not None and title_el.text else None
-            if rid and title:
-                mapping.setdefault(rid, set()).add(title)
-    return mapping
+            if not rid or title_el is None or not title_el.text:
+                continue
+            m.setdefault(rid, set()).add(title_el.text.strip())
+    return m
 
 
-def patch_intended_use(tree: ET.ElementTree, log: ChangeLog) -> None:
+def patch_intended_use(tree: ET.ElementTree, log: "ChangeLog") -> None:
+    """Canvas sometimes sets intendedUse='assignment' which 1.1 doesn't allow."""
     root = tree.getroot()
     for res in root.findall('.//{*}resource'):
         for attr in ('intendedUse', 'intendeduse'):
@@ -361,20 +381,15 @@ def patch_intended_use(tree: ET.ElementTree, log: ChangeLog) -> None:
                 log.intended_use_changes.append((res.get('identifier', 'UNKNOWN'), iu, 'unspecified'))
 
 
-def downshift_resource_types(tree: ET.ElementTree, log: ChangeLog) -> None:
-    """Re-map known v1p2 resource types to v1p1 where such types exist.
-    NOTE: Do NOT touch QTI 'xmlv1p2' (that’s QTI 1.2, not CC 1.2).
-    """
-    replacements = {
-        'imsdt_xmlv1p2': 'imsdt_xmlv1p1',  # discussion topic
-        'imswl_xmlv1p2': 'imswl_xmlv1p1',  # weblink
-    }
+def downshift_resource_types(tree: ET.ElementTree, log: "ChangeLog") -> None:
+    """Re-map known v1p2 resource types to v1p1 equivalents where they exist."""
+    repl = {'imsdt_xmlv1p2': 'imsdt_xmlv1p1', 'imswl_xmlv1p2': 'imswl_xmlv1p1'}
     root = tree.getroot()
     for res in root.findall('.//{*}resource'):
         rid = res.get('identifier', 'UNKNOWN')
-        rtype = res.get('type', '')
+        rtype = res.get('type') or ''
         new_type = rtype
-        for old, new in replacements.items():
+        for old, new in repl.items():
             if old in new_type:
                 new_type = new_type.replace(old, new)
         if new_type != rtype:
@@ -383,33 +398,33 @@ def downshift_resource_types(tree: ET.ElementTree, log: ChangeLog) -> None:
 
 
 def remove_items_referring_to(tree: ET.ElementTree, removed_ids: Set[str]) -> None:
-    root_el = tree.getroot()
-    for parent, item in iter_with_parent(root_el):
-        if localname(item.tag) == 'item' and item.get('identifierref') in removed_ids:
-            parent.remove(item)
+    """Drop <item> nodes whose identifierref points at a resource we removed."""
+    root = tree.getroot()
+    for parent in list(root.iter()):
+        for child in list(parent):
+            if child.tag.endswith('item') and (child.get('identifierref') in removed_ids):
+                parent.remove(child)
 
 
 def remove_dependencies_referring_to(tree: ET.ElementTree, removed_ids: Set[str]) -> None:
+    """Prune <dependency identifierref=...> that point at removed resources."""
     root = tree.getroot()
     for res in root.findall('.//{*}resource'):
         for dep in list(res.findall('{*}dependency')):
             if dep.get('identifierref') in removed_ids:
                 res.remove(dep)
 
-
 # ----------------------------- LTI removal ----------------------------------
 
 def is_lti_descriptor(xml_path: Path) -> bool:
+    """Very lightweight detection of IMS Basic LTI link descriptors."""
     try:
         txt = xml_path.read_text(encoding='utf-8', errors='ignore')
         root = ET.fromstring(txt)
     except Exception:
         return False
-    lname = localname(root.tag)
-    ns = ''
-    if root.tag.startswith('{'):
-        ns = root.tag.split('}')[0].strip('{')
-    # IMS Basic LTI link root element & namespace patterns
+    lname = root.tag.split('}', 1)[-1] if root.tag.startswith('{') else root.tag
+    ns = root.tag.split('}', 1)[0].strip('{') if root.tag.startswith('{') else ''
     if lname == 'cartridge_basiclti_link':
         return True
     if 'imslticc' in ns or 'imsbasiclti' in ns:
@@ -417,23 +432,23 @@ def is_lti_descriptor(xml_path: Path) -> bool:
     return False
 
 
-def remove_lti_resources(tree: ET.ElementTree, base_folder: Path, log: ChangeLog, res_id_to_titles: Dict[str, Set[str]]) -> Set[str]:
+def remove_lti_resources(tree: ET.ElementTree, base_folder: Path, log: "ChangeLog",
+                         res_id_to_titles: Dict[str, Set[str]]) -> Set[str]:
+    """Remove LTI resources outright (Moodle CC 1.1 import policy)."""
     root = tree.getroot()
     resources_parent = root.find('.//{*}resources')
     if resources_parent is None:
         return set()
 
     removed_ids: Set[str] = set()
-
     for res in list(resources_parent.findall('{*}resource')):
         rid = res.get('identifier') or 'UNKNOWN'
         rtype = (res.get('type') or '').lower()
         href = res.get('href')
 
-        # Quick type hints
         type_is_lti = ('imsbasiclti' in rtype) or ('basiclti' in rtype) or ('lti_link' in rtype)
-
         looks_lti = False
+
         targets: List[Path] = []
         if href:
             targets.append(base_folder / href)
@@ -441,11 +456,12 @@ def remove_lti_resources(tree: ET.ElementTree, base_folder: Path, log: ChangeLog
             fh = f.get('href')
             if fh:
                 targets.append(base_folder / fh)
+
         for p in targets:
-            if p.suffix.lower() == '.xml' and p.exists():
-                if is_lti_descriptor(p):
-                    looks_lti = True
-                    break
+            if p.suffix.lower() == '.xml' and p.exists() and is_lti_descriptor(p):
+                looks_lti = True
+                break
+
         if type_is_lti or looks_lti:
             resources_parent.remove(res)
             removed_ids.add(rid)
@@ -455,381 +471,17 @@ def remove_lti_resources(tree: ET.ElementTree, base_folder: Path, log: ChangeLog
     return removed_ids
 
 
-# ---------------------- Namespaces / schemalocation -------------------------
-
-def bump_manifest_version_and_namespaces(manifest_path: Path, tree: ET.ElementTree, log: ChangeLog) -> None:
+def drop_cp_variants(tree: ET.ElementTree) -> int:
+    """Remove any <variant> elements (CP extension) in the manifest."""
     root = tree.getroot()
+    removed = 0
+    for parent in list(root.iter()):
+        for child in list(parent):
+            if child.tag.split('}', 1)[-1] == 'variant':
+                parent.remove(child)
+                removed += 1
+    return removed
 
-    # 1) schemaversion: downshift anything >= 1.2 to 1.1.0 (coarse but safe for our purpose)
-    for sv in root.findall('.//{*}schemaversion'):
-        txt = (sv.text or '').strip()
-        if txt and (txt[0].isdigit() or txt.startswith('1.')):
-            if not txt.startswith('1.1'):
-                sv.text = '1.1.0'
-                log.version_bumped = f'{txt} -> 1.1.0'
-
-    # 2) Cleanly edit xsi:schemaLocation:
-    #    - drop any pair containing Curriculum Standards (imscsmd)
-    #    - drop any pair referencing CP extension (imscp_extensionv1p2 / cpextensionv1p2)
-    sl = root.get(XSI + 'schemaLocation')
-    if sl:
-        toks = sl.split()
-        pairs = list(zip(toks[0::2], toks[1::2]))
-        BAD_NS_SUBSTR = ('imscsmd', 'imscp_extensionv1p2')
-        BAD_LOC_SUBSTR = ('cpextensionv1p2', 'imscp_extensionv1p2')
-        # (We don't reuse `pairs` once we normalize, but keeping the filter documents intent.)
-        pairs = [
-            (ns, loc) for (ns, loc) in pairs
-            if not any(b in ns for b in BAD_NS_SUBSTR)
-            and not any(b in loc for b in BAD_LOC_SUBSTR)
-        ]
-
-    # Normalize schemaLocation to the canonical CC 1.1 trio (order matters for some importers)
-    want = [
-        (IMSP_V11,
-         "http://www.imsglobal.org/profile/cc/ccv1p1/ccv1p1_imscp_v1p1_v1p0.xsd"),
-        (LOM_MANIFEST_NS,
-         "http://www.imsglobal.org/profile/cc/ccv1p1/LOM/ccv1p1_lommanifest_v1p0.xsd"),
-        (LOM_RESOURCE_NS,
-         "http://www.imsglobal.org/profile/cc/ccv1p1/LOM/ccv1p1_lomresource_v1p0.xsd"),
-    ]
-    root.set(XSI + 'schemaLocation', ' '.join(x for p in want for x in p))
-
-    # 3) Write the tree (structural changes)
-    save_manifest(tree, manifest_path)
-
-    # 4) Textual cleanup: downshift remaining URIs and remove extra namespaces/elements
-    text = manifest_path.read_text(encoding='utf-8', errors='ignore')
-    for pat, repl in V12_TO_V11_SCHEMA_REPLACEMENTS:
-        text = text.replace(pat, repl)
-
-    # Final sweep for any profile ccv1p3 path segments we didn't enumerate
-    text = re.sub(r'(/profile/cc/)ccv1p3(/)', r'\1ccv1p1\2', text)
-
-    # Drop stray xmlns decls for curriculum standards ns prefixes
-    text = re.sub(r'\s+xmlns:(imscsmd|csmd)="[^"]+"', '', text)
-    # Drop CP extension (namespace + elements)
-    text = re.sub(CP_EXTENSION_XMLNS_DROP_REGEX, '', text)
-    text = re.sub(CP_EXTENSION_VARIANT_DROP_REGEX, '', text, flags=re.DOTALL)
-
-    manifest_path.write_text(text, encoding='utf-8')
-    log.namespaces_downgraded = True
-
-def patch_descriptor_xmls(root_folder: Path, log: ChangeLog) -> None:
-    for xmlpath in root_folder.rglob('*.xml'):
-        if xmlpath.name == 'imsmanifest.xml':
-            continue
-        try:
-            txt = xmlpath.read_text(encoding='utf-8', errors='ignore')
-        except Exception:
-            continue
-        original = txt
-        for pat, repl in V12_TO_V11_SCHEMA_REPLACEMENTS:
-            txt = txt.replace(pat, repl)
-        if txt != original:
-            xmlpath.write_text(txt, encoding='utf-8')
-            log.descriptor_schema_patches.append(xmlpath)
-
-# ----------------------------- QTI AUDIT ------------------------------------
-
-def classify_qti_xml(xml_path: Path) -> Tuple[str, Optional[str]]:
-    """Return (classification, note) without throwing.
-    classification ∈ { 'QTI 2.x', 'QTI 1.2', 'Not QTI/Unknown' }
-    note may mention vendor extensions if detected.
-    """
-    try:
-        txt = xml_path.read_text(encoding='utf-8', errors='ignore')
-    except Exception:
-        return 'Not QTI/Unknown', None
-
-    lowered = txt.lower()
-    vendor = any(h in lowered for h in VENDOR_HINTS)
-
-    try:
-        root = ET.fromstring(txt)
-        lname = localname(root.tag)
-        ns = ''
-        if root.tag.startswith('{'):
-            ns = root.tag.split('}')[0].strip('{')
-    except Exception:
-        if any(h in lowered for h in QTI2_NAMESPACE_HINTS):
-            return 'QTI 2.x', 'Detected by namespace text (parse failed)'
-        return 'Not QTI/Unknown', None
-
-    if lname in QTI2_ROOTS or any(h in ns for h in QTI2_NAMESPACE_HINTS):
-        note = 'Vendor-specific extensions present' if vendor else None
-        return 'QTI 2.x', note
-
-    if lname == QTI12_ROOT:
-        note = 'Canvas/Instructure extensions detected in QTI 1.2' if vendor else None
-        return 'QTI 1.2', note
-
-    return 'Not QTI/Unknown', None
-
-
-def audit_qti_resources(root_folder: Path, tree: ET.ElementTree, log: ChangeLog, res_id_to_titles: Dict[str, Set[str]]) -> None:
-    root = tree.getroot()
-    for res in root.findall('.//{*}resource'):
-        rtype = (res.get('type') or '').lower()
-        rid = res.get('identifier') or 'UNKNOWN'
-
-        is_qtiish = 'imsqti' in rtype or 'qti' in rtype
-        target_paths: List[Path] = []
-
-        href = res.get('href')
-        if href:
-            target_paths.append(root_folder / href)
-        for f in res.findall('{*}file'):
-            fh = f.get('href')
-            if fh:
-                target_paths.append(root_folder / fh)
-
-        seen: Set[Path] = set()
-        xml_targets = []
-        for p in target_paths:
-            if p.suffix.lower() == '.xml':
-                rp = p.resolve()
-                if rp not in seen:
-                    seen.add(rp)
-                    xml_targets.append(rp)
-
-        classification: Optional[str] = None
-        note: Optional[str] = None
-
-        if is_qtiish or xml_targets:
-            for xmlp in xml_targets[:5]:  # cap to first few files
-                c, n = classify_qti_xml(xmlp)
-                if c != 'Not QTI/Unknown':
-                    classification = c
-                    note = n
-                    break
-            if not classification and is_qtiish:
-                classification = 'Not QTI/Unknown'
-
-        if classification:
-            titles = "; ".join(sorted(res_id_to_titles.get(rid, []))) or None
-            log.qti_audit.append((rid, titles, classification, note))
-
-def _qmd_value(root: ET.Element, label: str) -> Optional[str]:
-    for f in root.findall('.//{*}qtimetadatafield'):
-        l = f.find('{*}fieldlabel'); v = f.find('{*}fieldentry')
-        if l is not None and v is not None and (l.text or '').strip() == label:
-            return (v.text or '').strip()
-    return None
-
-
-def _resp_lid_and_labels(item: ET.Element) -> Tuple[Optional[ET.Element], List[ET.Element]]:
-    rl = item.find('.//{*}response_lid')
-    if rl is None:
-        return None, []
-    labels = rl.findall('.//{*}response_label')
-    return rl, labels
-
-
-def fix_qti_true_false_in_place(xml_path: Path, fallback_tf_to_mc: bool, log: ChangeLog) -> bool:
-    """
-    Normalize Canvas-flavored QTI 1.2 True/False items so Moodle's CC 1.1 importer accepts them.
-    Rules we enforce:
-      • Exactly two <response_label> under a single <response_lid>, with idents literally "true" and "false".
-      • ALL <varequal> values rewritten to "true"/"false". Any other identifier is removed or remapped.
-      • Optional fallback: if there are more than 2 labels and fallback_tf_to_mc=True, convert to single‑answer MC.
-    """
-    try:
-        txt = xml_path.read_text(encoding='utf-8', errors='ignore')
-        root = ET.fromstring(txt)
-    except Exception:
-        return False  # not XML or not parseable → ignore
-
-    if localname(root.tag) != 'questestinterop':
-        return False  # not QTI 1.2
-
-    changed_any = False
-
-    def label_text(el: ET.Element) -> str:
-        mt = el.find('.//{*}mattext')
-        return (mt.text or '').strip().lower() if (mt is not None and mt.text) else ''
-
-    # Helper: remove all <other/> branches inside respcondition/conditionvar
-    def drop_other_branches(item: ET.Element):
-        for rc in item.findall('.//{*}respcondition'):
-            cv = rc.find('{*}conditionvar')
-            if cv is None:
-                continue
-            removed = False
-            for o in list(cv.findall('{*}other')):
-                cv.remove(o)
-                removed = True
-            if removed:
-                nonlocal changed_any
-                changed_any = True
-
-    # Pass each <item>
-    for item in root.findall('.//{*}item'):
-        qtype = (_qmd_value(item, 'question_type') or '').strip().lower()
-        rl = item.find('.//{*}response_lid')
-        labels = rl.findall('{*}response_label') if rl is not None else []
-
-        # Heuristic: some Canvas exports omit metadata but look like TF by label text
-        looks_tf = False
-        if rl is not None and len(labels) >= 2:
-            first_two = {label_text(labels[0]), label_text(labels[1])}
-            looks_tf = bool(first_two & {'true','false'})
-        is_tf = (qtype == 'true_false_question') or looks_tf
-        if not is_tf:
-            continue
-
-        # If there are not exactly two labels, resolve:
-        if rl is None or len(labels) != 2:
-            if fallback_tf_to_mc:
-                # Flip metadata to multiple choice
-                for f in item.findall('.//{*}qtimetadatafield'):
-                    lbl = f.find('{*}fieldlabel'); ent = f.find('{*}fieldentry')
-                    if lbl is not None and ent is not None and (lbl.text or '').strip() == 'question_type':
-                        ent.text = 'multiple_choice_question'
-                drop_other_branches(item)
-                log.tf_mc_fallback += 1
-                changed_any = True
-            else:
-                # Best effort: collapse to exactly two by picking the first two labels that look like true/false,
-                # else keep the first two and drop the rest.
-                if rl is not None and len(labels) > 2:
-                    # Prefer labels matching 'true'/'false' text
-                    true_like = [l for l in labels if label_text(l) in {'true'}]
-                    false_like = [l for l in labels if label_text(l) in {'false'}]
-                    keep = []
-                    if true_like and false_like:
-                        keep = [true_like[0], false_like[0]]
-                    else:
-                        keep = labels[:2]
-                    for l in list(labels):
-                        if l not in keep:
-                            rl.remove(l)
-                            changed_any = True
-                    labels = keep
-                else:
-                    log.tf_skipped += 1
-                    continue  # can't fix
-            # After MC fallback we don't try further TF normalization for this item.
-            if fallback_tf_to_mc:
-                continue
-
-        # At this point we have 2 labels
-        l1, l2 = labels[0], labels[1]
-        old_id1, old_id2 = (l1.get('ident') or ''), (l2.get('ident') or '')
-        t1, t2 = label_text(l1), label_text(l2)
-
-        # Determine which should be 'true' vs 'false'
-        # Prefer resprocessing → else label text → else default by position
-        correct_ident = None
-        for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
-            val = (ve.text or '').strip()
-            if val:
-                correct_ident = val
-                break
-
-        mapping: Dict[str, str] = {}
-        if correct_ident in {old_id1, old_id2}:
-            mapping[correct_ident] = 'true'
-            mapping[old_id1 if correct_ident == old_id2 else old_id2] = 'false'
-        elif {t1, t2} == {'true','false'}:
-            mapping[old_id1] = t1
-            mapping[old_id2] = t2
-        else:
-            # If undecidable, default first→true, second→false (consistent + deterministic)
-            mapping[old_id1] = 'true'
-            mapping[old_id2] = 'false'
-
-        # Apply new idents to labels
-        if l1.get('ident') != mapping[old_id1]:
-            l1.set('ident', mapping[old_id1]); changed_any = True
-        if l2.get('ident') != mapping[old_id2]:
-            l2.set('ident', mapping[old_id2]); changed_any = True
-
-        # Rewrite ALL varequal values to the new idents; also purge unknown identifiers
-        valid_new = {mapping[old_id1], mapping[old_id2]}
-        for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
-            val = (ve.text or '').strip()
-            # Map from any of the old ids to the canonical 'true'/'false'
-            if val in mapping:
-                if ve.text != mapping[val]:
-                    ve.text = mapping[val]; changed_any = True
-            elif val.lower() in {'true','false'}:
-                # normalize case if Canvas happened to use text idents already
-                if ve.text != val.lower():
-                    ve.text = val.lower(); changed_any = True
-            else:
-                # Unknown ident: Moodle will choke; remap to 'false' (safe default) and log
-                ve.text = 'false'; changed_any = True
-
-        # Ensure exactly two labels remain and are literally 'true'/'false'
-        # (In case earlier we collapsed a longer set.)
-        for extra in list(rl.findall('{*}response_label'))[2:]:
-            rl.remove(extra); changed_any = True
-        # Enforce lowercase canonical idents
-        if (l1.get('ident') not in {'true','false'}) or (l2.get('ident') not in {'true','false'}):
-            # If mapping somehow produced non-canonical values, coerce by position
-            l1.set('ident','true'); l2.set('ident','false'); changed_any = True
-            # And rewrite varequals accordingly
-            for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
-                ve.text = 'true' if ve.text.strip().lower() == 'true' else 'false'
-
-        # Drop any <other/> branches
-        drop_other_branches(item)
-
-        # Count success
-        log.tf_fixed += 1
-
-    if changed_any:
-        # Re-serialize
-        xml_path.write_bytes(ET.tostring(root, encoding='utf-8', xml_declaration=True))
-    return changed_any
-
-
-def _has_bad_tf_idents(xml_path: Path) -> bool:
-    """Return True if file contains any TF item that Moodle would reject."""
-    try:
-        txt = xml_path.read_text(encoding='utf-8', errors='ignore')
-        root = ET.fromstring(txt)
-    except Exception:
-        return False
-    if localname(root.tag) != 'questestinterop':
-        return False
-    for item in root.findall('.//{*}item'):
-        qtype = (_qmd_value(item, 'question_type') or '').strip().lower()
-        if qtype != 'true_false_question':
-            # Heuristic: also treat items that *look* TF (exactly two labels with true/false text) as TF
-            rl = item.find('.//{*}response_lid')
-            labels = rl.findall('{*}response_label') if rl is not None else []
-            if rl is None or len(labels) != 2:
-                continue
-            tset = {(labels[0].find('.//{*}mattext').text or '').strip().lower() if labels[0].find('.//{*}mattext') is not None else '',
-                    (labels[1].find('.//{*}mattext').text or '').strip().lower() if labels[1].find('.//{*}mattext') is not None else ''}
-            if tset != {'true','false'}:
-                continue
-        rl = item.find('.//{*}response_lid')
-        labels = rl.findall('{*}response_label') if rl is not None else []
-        if rl is None or len(labels) != 2:
-            return True
-        idset = {(labels[0].get('ident') or '').lower(), (labels[1].get('ident') or '').lower()}
-        if idset != {'true','false'}:
-            return True
-        for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
-            if (ve.text or '').strip().lower() not in {'true','false'}:
-                return True
-    return False
-
-def assert_no_bad_tf_idents(root_folder: Path) -> None:
-    offenders = []
-    for xmlp in root_folder.rglob('*.xml'):
-        if xmlp.name.lower() == 'imsmanifest.xml':
-            continue
-        if _has_bad_tf_idents(xmlp):
-            offenders.append(str(xmlp))
-    if offenders:
-        raise ValueError(
-    "Unfixed TF items remain (idents must be 'true'/'false' and varequal must reference them) in:\n"
-    + "\n".join(offenders)
-)
 
 def log_tf_validation_issues(root_folder: Path) -> None:
     """
@@ -940,7 +592,318 @@ def normalize_default_ns(tree: ET.ElementTree) -> None:
 
     retag_imscp(root)
 
+def bump_manifest_version_and_namespaces(manifest_path: Path, tree: ET.ElementTree, log: "ChangeLog") -> None:
+    root = tree.getroot()
 
+    # 1) schemaversion: downshift anything >= 1.2 to 1.1.0
+    for sv in root.findall('.//{*}schemaversion'):
+        txt = (sv.text or '').strip()
+        if txt and (txt[0].isdigit() or txt.startswith('1.')):
+            if not txt.startswith('1.1'):
+                sv.text = '1.1.0'
+                log.version_bumped = f'{txt} -> 1.1.0'
+
+    # 2) Clean up xsi:schemaLocation: drop imscsmd (Curriculum Standards) and CP extension pairs
+    sl = root.get(XSI + 'schemaLocation')
+    if sl:
+        toks = sl.split()
+        pairs = list(zip(toks[0::2], toks[1::2]))
+        BAD_NS_SUBSTR = ('imscsmd', 'imscp_extensionv1p2')
+        BAD_LOC_SUBSTR = ('cpextensionv1p2', 'imscp_extensionv1p2')
+        pairs = [
+            (ns, loc) for (ns, loc) in pairs
+            if not any(b in ns for b in BAD_NS_SUBSTR)
+            and not any(b in loc for b in BAD_LOC_SUBSTR)
+        ]
+
+    # 3) Set canonical CC 1.1 schemaLocation (order matters for Moodle)
+    want = [
+        (IMSP_V11,
+         "http://www.imsglobal.org/profile/cc/ccv1p1/ccv1p1_imscp_v1p1_v1p0.xsd"),
+        (LOM_MANIFEST_NS,
+         "http://www.imsglobal.org/profile/cc/ccv1p1/LOM/ccv1p1_lommanifest_v1p0.xsd"),
+        (LOM_RESOURCE_NS,
+         "http://www.imsglobal.org/profile/cc/ccv1p1/LOM/ccv1p1_lomresource_v1p0.xsd"),
+    ]
+    root.set(XSI + 'schemaLocation', ' '.join(x for p in want for x in p))
+
+    # 4) Save structural changes
+    save_manifest(tree, manifest_path)
+
+    # 5) Text sweeps: downshift v1p3/v1p2 URIs, drop extra xmlns + <variant/> blocks
+    text = manifest_path.read_text(encoding='utf-8', errors='ignore')
+    for pat, repl in V12_TO_V11_SCHEMA_REPLACEMENTS:
+        text = text.replace(pat, repl)
+
+    # Generic v1p3 → v1p1 fallback for any missed profile paths
+    text = re.sub(r'(/profile/cc/)ccv1p3(/)', r'\1ccv1p1\2', text)
+
+    # Drop stray Curriculum Standards xmlns and CP extension artifacts
+    text = re.sub(r'\s+xmlns:(imscsmd|csmd)="[^"]+"', '', text)
+    text = re.sub(CP_EXTENSION_XMLNS_DROP_REGEX, '', text)
+    text = re.sub(CP_EXTENSION_VARIANT_DROP_REGEX, '', text, flags=re.DOTALL)
+
+    manifest_path.write_text(text, encoding='utf-8')
+    log.namespaces_downgraded = True
+
+def patch_descriptor_xmls(root_folder: Path, log: "ChangeLog") -> None:
+    """
+    Rewrite discussion/weblink descriptor XMLs that reference v1p2 schemas
+    (imsdt_v1p2, imswl_v1p2) to v1p1 equivalents.
+    """
+    for xmlpath in root_folder.rglob('*.xml'):
+        if xmlpath.name == 'imsmanifest.xml':
+            continue
+        try:
+            txt = xmlpath.read_text(encoding='utf-8', errors='ignore')
+        except Exception:
+            continue
+        original = txt
+        for pat, repl in V12_TO_V11_SCHEMA_REPLACEMENTS:
+            txt = txt.replace(pat, repl)
+        if txt != original:
+            try:
+                xmlpath.write_text(txt, encoding='utf-8')
+                log.descriptor_schema_patches.append(xmlpath)
+            except Exception:
+                # Non-fatal; leave file as-is
+                pass
+
+def rezip_folder(src_folder: Path, dest_zip: Path) -> None:
+    dest_zip = dest_zip.with_suffix('.imscc')
+    with zipfile.ZipFile(dest_zip, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(src_folder):
+            for fname in files:
+                fpath = Path(root) / fname
+                arcname = str(fpath.relative_to(src_folder))
+                z.write(fpath, arcname)
+
+def _qmd_value(root: ET.Element, label: str) -> Optional[str]:
+    for f in root.findall('.//{*}qtimetadatafield'):
+        l = f.find('{*}fieldlabel'); v = f.find('{*}fieldentry')
+        if l is not None and v is not None and (l.text or '').strip() == label:
+            return (v.text or '').strip()
+    return None
+
+
+def fix_qti_true_false_in_place(xml_path: Path, fallback_tf_to_mc: bool, log: "ChangeLog") -> bool:
+    """Normalize Canvas-flavored QTI 1.2 True/False items to Moodle-friendly form."""
+    try:
+        txt = xml_path.read_text(encoding='utf-8', errors='ignore')
+        root = ET.fromstring(txt)
+    except Exception:
+        return False
+    if (root.tag.split('}', 1)[-1] if root.tag.startswith('{') else root.tag) != 'questestinterop':
+        return False
+
+    def mattext_lower(el: ET.Element) -> str:
+        mt = el.find('.//{*}mattext')
+        return (mt.text or '').strip().lower() if (mt is not None and mt.text) else ''
+
+    changed_any = False
+
+    def drop_other(item: ET.Element):
+        nonlocal changed_any
+        for rc in item.findall('.//{*}respcondition'):
+            cv = rc.find('{*}conditionvar')
+            if cv is None:
+                continue
+            for o in list(cv.findall('{*}other')):
+                cv.remove(o); changed_any = True
+
+    for item in root.findall('.//{*}item'):
+        qtype = (_qmd_value(item, 'question_type') or '').strip().lower()
+        rl = item.find('.//{*}response_lid')
+        labels = rl.findall('{*}response_label') if rl is not None else []
+        looks_tf = rl is not None and len(labels) >= 2 and ({mattext_lower(labels[0]), mattext_lower(labels[1])} & {'true','false'})
+        is_tf = (qtype == 'true_false_question') or looks_tf
+        if not is_tf:
+            continue
+
+        if rl is None or len(labels) != 2:
+            if fallback_tf_to_mc:
+                # change metadata only; Moodle will treat as 2-option MC
+                for f in item.findall('.//{*}qtimetadatafield'):
+                    lbl = f.find('{*}fieldlabel'); ent = f.find('{*}fieldentry')
+                    if lbl is not None and ent is not None and (lbl.text or '').strip() == 'question_type':
+                        ent.text = 'multiple_choice_question'
+                drop_other(item)
+                log.tf_mc_fallback += 1
+                changed_any = True
+                continue
+            # collapse to two (prefer true/false text)
+            if rl is not None and len(labels) > 2:
+                true_like = [l for l in labels if mattext_lower(l) == 'true']
+                false_like = [l for l in labels if mattext_lower(l) == 'false']
+                keep = [true_like[0], false_like[0]] if (true_like and false_like) else labels[:2]
+                for l in list(labels):
+                    if l not in keep:
+                        rl.remove(l); changed_any = True
+                labels = keep
+            else:
+                log.tf_skipped += 1
+                continue
+
+        # now exactly two
+        l1, l2 = labels[0], labels[1]
+        id1, id2 = (l1.get('ident') or ''), (l2.get('ident') or '')
+        t1, t2 = mattext_lower(l1), mattext_lower(l2)
+
+        correct_ident = None
+        for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
+            val = (ve.text or '').strip()
+            if val:
+                correct_ident = val; break
+
+        mapping: Dict[str,str] = {}
+        if correct_ident in {id1, id2}:
+            mapping[correct_ident] = 'true'
+            mapping[id1 if correct_ident == id2 else id2] = 'false'
+        elif {t1, t2} == {'true','false'}:
+            mapping[id1] = t1; mapping[id2] = t2
+        else:
+            mapping[id1] = 'true'; mapping[id2] = 'false'
+
+        if l1.get('ident') != mapping[id1]:
+            l1.set('ident', mapping[id1]); changed_any = True
+        if l2.get('ident') != mapping[id2]:
+            l2.set('ident', mapping[id2]); changed_any = True
+
+        for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
+            val = (ve.text or '').strip()
+            if val in mapping:
+                if ve.text != mapping[val]:
+                    ve.text = mapping[val]; changed_any = True
+            elif val.lower() in {'true','false'}:
+                if ve.text != val.lower():
+                    ve.text = val.lower(); changed_any = True
+            else:
+                ve.text = 'false'; changed_any = True
+
+        # ensure only two labels and canonical idents
+        for extra in list(rl.findall('{*}response_label'))[2:]:
+            rl.remove(extra); changed_any = True
+
+        if { (l1.get('ident') or '').lower(), (l2.get('ident') or '').lower() } != {'true','false'}:
+            l1.set('ident', 'true'); l2.set('ident', 'false'); changed_any = True
+            for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
+                ve.text = 'true' if (ve.text or '').strip().lower() == 'true' else 'false'
+
+        drop_other(item)
+        log.tf_fixed += 1
+
+    if changed_any:
+        xml_path.write_bytes(ET.tostring(root, encoding='utf-8', xml_declaration=True))
+    return changed_any
+
+
+def _has_bad_tf_idents(xml_path: Path) -> bool:
+    try:
+        txt = xml_path.read_text(encoding='utf-8', errors='ignore')
+        root = ET.fromstring(txt)
+    except Exception:
+        return False
+    if (root.tag.split('}', 1)[-1] if root.tag.startswith('{') else root.tag) != 'questestinterop':
+        return False
+    for item in root.findall('.//{*}item'):
+        qtype = (_qmd_value(item, 'question_type') or '').strip().lower()
+        rl = item.find('.//{*}response_lid')
+        labels = rl.findall('{*}response_label') if rl is not None else []
+        is_tf = (qtype == 'true_false_question')
+        if not is_tf and rl is not None and len(labels) == 2:
+            texts = { (labels[0].find('.//{*}mattext').text or '').strip().lower() if labels[0].find('.//{*}mattext') is not None else '',
+                      (labels[1].find('.//{*}mattext').text or '').strip().lower() if labels[1].find('.//{*}mattext') is not None else '' }
+            is_tf = (texts == {'true','false'})
+        if not is_tf:
+            continue
+        if rl is None or len(labels) != 2:
+            return True
+        idset = {(labels[0].get('ident') or '').lower(), (labels[1].get('ident') or '').lower()}
+        if idset != {'true','false'}:
+            return True
+        for ve in item.findall('.//{*}respcondition/{*}conditionvar/{*}varequal'):
+            if (ve.text or '').strip().lower() not in {'true','false'}:
+                return True
+    return False
+
+
+def assert_no_bad_tf_idents(root_folder: Path) -> None:
+    offenders: List[str] = []
+    for xmlp in root_folder.rglob('*.xml'):
+        if xmlp.name.lower() == 'imsmanifest.xml':
+            continue
+        if _has_bad_tf_idents(xmlp):
+            offenders.append(str(xmlp))
+    if offenders:
+        raise ValueError(
+            "Unfixed TF items remain (idents must be 'true'/'false' and varequal must reference them) in:\n"
+            + "\n".join(offenders)
+        )
+        
+def classify_qti_xml(xml_path: Path) -> Tuple[str, Optional[str]]:
+    """Return (classification, note): 'QTI 2.x' | 'QTI 1.2' | 'Not QTI/Unknown'."""
+    try:
+        txt = xml_path.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return 'Not QTI/Unknown', None
+    lowered = txt.lower()
+    vendor = any(h in lowered for h in ('canvas', 'instructure'))
+    try:
+        root = ET.fromstring(txt)
+        lname = root.tag.split('}', 1)[-1] if root.tag.startswith('{') else root.tag
+        ns = root.tag.split('}', 1)[0].strip('{') if root.tag.startswith('{') else ''
+    except Exception:
+        if ('imsqti_v2p' in lowered) or ('imsqti_v2' in lowered):
+            return 'QTI 2.x', 'Detected by namespace text (parse failed)'
+        return 'Not QTI/Unknown', None
+    if lname in {'assessmentItem','assessmentTest'} or ('imsqti_v2' in ns) or ('imsqti_v2p' in ns):
+        return ('QTI 2.x', 'Vendor-specific extensions present' if vendor else None)
+    if lname == 'questestinterop':
+        return ('QTI 1.2', 'Canvas extensions detected' if vendor else None)
+    return 'Not QTI/Unknown', None
+
+
+def audit_qti_resources(root_folder: Path, tree: ET.ElementTree, log: "ChangeLog",
+                        res_id_to_titles: Dict[str, Set[str]]) -> None:
+    root = tree.getroot()
+    for res in root.findall('.//{*}resource'):
+        rtype = (res.get('type') or '').lower()
+        rid = res.get('identifier') or 'UNKNOWN'
+        is_qtiish = 'imsqti' in rtype or 'qti' in rtype
+
+        targets: List[Path] = []
+        href = res.get('href')
+        if href:
+            targets.append(root_folder / href)
+        for f in res.findall('{*}file'):
+            fh = f.get('href')
+            if fh:
+                targets.append(root_folder / fh)
+
+        seen: Set[Path] = set()
+        xml_targets: List[Path] = []
+        for p in targets:
+            if p.suffix.lower() == '.xml':
+                rp = p.resolve()
+                if rp not in seen:
+                    seen.add(rp); xml_targets.append(rp)
+
+        classification: Optional[str] = None
+        note: Optional[str] = None
+        if is_qtiish or xml_targets:
+            for xmlp in xml_targets[:5]:
+                c, n = classify_qti_xml(xmlp)
+                if c != 'Not QTI/Unknown':
+                    classification, note = c, n
+                    break
+            if not classification and is_qtiish:
+                classification = 'Not QTI/Unknown'
+
+        if classification:
+            titles = "; ".join(sorted(res_id_to_titles.get(rid, []))) or None
+            log.qti_audit.append((rid, titles, classification, note))
+
+            
 def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool = False) -> Path:
     input_zip = input_zip.resolve()
     output_dir = output_dir.resolve()
@@ -961,10 +924,12 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
     # 2) Parse manifest
     tree = load_manifest(manifest_path)
 
-    # 2b) Fast-exit if already CC 1.0/1.1
+# 2b) If already CC 1.0/1.1, only pass-through if there are NO Canvas QTI artifacts
     ver = manifest_cc_version(tree)
-    if ver and (ver.startswith('1.0') or ver.startswith('1.1')):
-        print(f"Detected Common Cartridge {ver}. No downgrade needed.")
+    force_qti, reasons, _ = detect_canvas_qti_artifacts(manifest_path, tmp)
+    
+    if ver and (ver.startswith('1.0') or ver.startswith('1.1')) and not force_qti:
+        print(f"Detected Common Cartridge {ver}. No downgrade needed (no QTI normalization required).")
         output_dir.mkdir(parents=True, exist_ok=True)
         dest = output_dir / Path(input_zip.name)
         if str(input_zip.resolve()) != str(dest.resolve()):
@@ -972,6 +937,8 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
         print(f"Output written to: {dest}")
         return dest
 
+    if ver and (ver.startswith('1.0') or ver.startswith('1.1')) and force_qti:
+        print(f"Detected Common Cartridge {ver} wrapper with Canvas QTI artifacts → proceeding with QTI normalization.")
 
     # 3) Remove Curriculum Standards metadata (1.2+ only)
     prune_curriculum_standards(tree, log)
@@ -1079,3 +1046,13 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def iter_all_qti_files(extracted_dir: Path):
+    # Standard CC assessments
+    for p in extracted_dir.rglob('*/assessment_qti.xml'):
+        yield p
+    # Canvas sidecar QTI
+    for p in extracted_dir.rglob('non_cc_assessments/*.xml.qti'):
+        yield p
+
