@@ -5,8 +5,8 @@ imscc_12_to_11_downgrader.py
 Purpose
 -------
 Given a Canvas-exported IMS Common Cartridge (IMSCC) package that
-uses the v1.2 profile (or embeds v1.2 schema URIs), create a best‑effort
-v1.1‑compatible cartridge suitable for Moodle import.
+uses the v1.2 profile (or embeds v1.2 schema URIs), create a best-effort
+v1.1-compatible cartridge suitable for Moodle import.
 
 What it does (safe, "easy" downgrades)
 --------------------------------------
@@ -22,16 +22,16 @@ What it does (safe, "easy" downgrades)
    • Remove dangling `<dependency>` references to deleted resources.
 3) Rewrites discussion/weblink descriptor XMLs that reference v1p2
    schemas (imsdt_v1p2, imswl_v1p2) to their v1p1 counterparts.
-4) **QTI audit:** Detects QTI 2.x and Canvas‑flavored QTI 1.2; reports
+4) **QTI audit:** Detects QTI 2.x and Canvas-flavored QTI 1.2; reports
    potential import risk (no rewrites).
 5) Repackages everything as a new **.imscc** file.
 6) Prints a concise change report.
 
 What it does *not* do (on purpose)
 ----------------------------------
-• It does not rewrite QTI assessment internals. If a quiz uses 1.2‑only
-  logic (e.g., fill‑in‑the‑blank OR), Moodle may still drop/alter items.
-• It does not promise a lossless round‑trip.
+• It does not rewrite QTI assessment internals. If a quiz uses 1.2-only
+  logic (e.g., fill-in-the-blank OR), Moodle may still drop/alter items.
+• It does not promise a lossless round-trip.
 
 Usage
 -----
@@ -42,7 +42,7 @@ Or:
 $ python3 imscc_12_to_11_downgrader.py --input /path/to/file.imscc --output /dest/dir
 
 Tested with Python 3.11+ and designed for 3.13.
-No third‑party deps; macOS‑friendly.
+No third-party deps; macOS-friendly.
 
 Notes
 -----
@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import zipfile
 import urllib.parse
+import xml.etree.ElementTree as ET
 
 def canonicalize_href(h: str) -> str:
     """
@@ -88,9 +89,6 @@ def ensure_canonical_file(base_folder: Path, relpath: str) -> str:
         enc_abs.parent.mkdir(parents=True, exist_ok=True)
         if os.path.abspath(dec_abs) != os.path.abspath(enc_abs):
             shutil.copy2(dec_abs, enc_abs)
-
-    # If neither exists, just return the encoded relpath; caller will decide to stub if needed
-    # If both exist, prefer the encoded. (Optionally you can remove the decoded twin here.)
 
     # Normalize to forward slashes for manifest
     return "/".join(Path(enc).parts)
@@ -147,7 +145,6 @@ def detect_canvas_qti_artifacts(manifest_path: Path, extracted_dir: Path):
 
     should_force = len(reasons) > 0 or len(uniq) > 0
     return should_force, reasons, uniq
-import xml.etree.ElementTree as ET
 
 # ---------------------------------------------------------------------------
 # XML / CC helpers
@@ -199,9 +196,7 @@ V12_TO_V11_SCHEMA_REPLACEMENTS = [
 ]
 
 # Patterns to remove CP extension (imscp_extensionv1p2) artifacts outright
-# - Drop xmlns:cpx / xmlns:ns3 declarations
 CP_EXTENSION_XMLNS_DROP_REGEX = r'\s+xmlns:(?:cpx|ns3)="[^"]+"'
-# - Drop <cpx:variant>...</cpx:variant> or alias <ns3:variant>...</ns3:variant>
 CP_EXTENSION_VARIANT_DROP_REGEX = r'<(?:cpx|ns3):variant\b[^>]*>.*?</(?:cpx|ns3):variant>'
 
 # CC 1.2+ Curriculum Standards namespace hint
@@ -848,8 +843,6 @@ def fix_qti_true_false_in_place(xml_path: Path, fallback_tf_to_mc: bool, log: "C
     if changed_any:
         xml_path.write_bytes(ET.tostring(root, encoding='utf-8', xml_declaration=True))
     return changed_any
-
-
 def _has_bad_tf_idents(xml_path: Path) -> bool:
     try:
         txt = xml_path.read_text(encoding='utf-8', errors='ignore')
@@ -1219,6 +1212,32 @@ def remove_empty_qti_assessments(tree: ET.ElementTree, base_folder: Path) -> int
         for dep in list(res.findall('{*}dependency')):
             if (dep.get('identifierref') or '') in empty_ids:
                 res.remove(dep)
+    
+    # Also remove orphaned assessment_meta resources for the removed assessments
+    resources_parent = root.find('.//{*}resources')
+    if resources_parent is not None:
+        removed_folders = set()
+        for rid in empty_ids:
+            res = root.find(f".//{{*}}resource[@identifier='{rid}']")
+            if res is not None:
+                href = (res.get('href') or '')
+                folder = href.split('/', 1)[0] if '/' in href else ''
+                if folder:
+                    removed_folders.add(folder)
+
+        for res in list(resources_parent.findall('{*}resource')):
+            href = (res.get('href') or '')
+            if href.endswith('/assessment_meta.xml'):
+                folder = href.split('/', 1)[0]
+                if folder in removed_folders:
+                    resources_parent.remove(res)
+
+        # prune any dependencies to now-missing meta resources
+        valid_ids = {r.get('identifier') for r in resources_parent.findall('{*}resource') if r.get('identifier')}
+        for res in resources_parent.findall('{*}resource'):
+            for dep in list(res.findall('{*}dependency')):
+                if (dep.get('identifierref') or '') not in valid_ids:
+                    res.remove(dep)
 
     return len(empty_ids)      
 
@@ -1268,8 +1287,6 @@ def sanitize_html_like_resources(tree: ET.ElementTree, base_folder: Path) -> Tup
         )
 
     for res in list(root.findall('.//{*}resource')):
-        # We’ll treat anything with type containing 'webcontent' or 'learning-application-resource'
-        # as a candidate; plus anything whose href/first-file looks html-ish.
         rtype = (res.get('type') or '').lower()
         href_raw = _first_href(res)
         rid = res.get('identifier') or '(unknown)'
@@ -1280,20 +1297,14 @@ def sanitize_html_like_resources(tree: ET.ElementTree, base_folder: Path) -> Tup
             print(f"[MANIFEST] removed page-like resource with no href (id={rid})")
             continue
 
-        # Canonicalize (encode space and parentheses etc.)
         href_enc = canonicalize_href(href_raw)
-
-        # Ensure the file lives at the encoded path (rename decoded -> encoded if needed)
         href_enc = ensure_canonical_file(base_folder, href_enc)
-
         target = (base_folder / href_enc)
 
-        # Determine if we should require HTML content
         looks_html = href_enc.lower().endswith(('.html', '.htm'))
         is_page_like = looks_html or ('webcontent' in rtype) or ('learning-application-resource' in rtype)
 
         if is_page_like:
-            # Directory or missing target -> create stub HTML and point to it
             if (not target.exists()) or target.is_dir():
                 stub_rel = Path(href_enc).with_suffix('.html')
                 stub_path = (base_folder / stub_rel)
@@ -1303,14 +1314,12 @@ def sanitize_html_like_resources(tree: ET.ElementTree, base_folder: Path) -> Tup
                 print(f"[MANIFEST] html fix: wrote stub for {rid} -> {stub_rel}")
                 continue
 
-            # If it exists and is html-ish, just point manifest at canonical value
             _point_res_to(res, href_enc)
             if href_enc != href_raw:
                 patched += 1
                 print(f"[MANIFEST] canonicalized href for {rid}: {href_raw} -> {href_enc}")
             continue
 
-        # Non-HTML webcontent (pdf/png/etc.): leave as-is but canonicalize manifest
         _point_res_to(res, href_enc)
         if href_enc != href_raw:
             patched += 1
@@ -1341,7 +1350,6 @@ def audit_html_resources(tree: ET.ElementTree, base_folder: Path) -> None:
         rid  = res.get('identifier') or '?'
         href = first_href(res)
         if not href:
-            # other checks will remove; but note as 'missing href'
             offenders.append((rid, '(no href)', 'missing-href'))
             continue
         if not href.lower().endswith(('.html', '.htm')):
@@ -1365,14 +1373,20 @@ def audit_html_resources(tree: ET.ElementTree, base_folder: Path) -> None:
 
 
 
-def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool = False, exclude_kinds: Optional[Set[str]] = None) -> Path:
+# PATCH: added exclude_hrefs parameter (threaded from main), no other behavior changed
+def process_cartridge(input_zip: Path,
+                      output_dir: Path,
+                      tf_to_mc_fallback: bool = False,
+                      exclude_kinds: Optional[Set[str]] = None,
+                      exclude_hrefs: Optional[List[str]] = None) -> Path:
     # normalize paths (prevents write errors on rezip)
     input_zip = input_zip.resolve()
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # normalize exclude set
+    # normalize exclude sets
     exclude_kinds = exclude_kinds or set()
+    exclude_hrefs = exclude_hrefs or []
 
     log = ChangeLog()
 
@@ -1397,7 +1411,6 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
         print(f"Detected Common Cartridge {ver}. No downgrade needed (no QTI normalization required).")
         output_dir.mkdir(parents=True, exist_ok=True)
         dest = output_dir / input_zip.name
-        # avoid copying a file onto itself
         if input_zip.resolve() != dest.resolve():
             shutil.copy2(str(input_zip), str(dest))
         print(f"Output written to: {dest}")
@@ -1431,9 +1444,9 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
             print(f"[EXCLUDE] dropped resources -> " +
                   ", ".join(f"{k}:{v}" for k,v in dropped.items() if v))
             
-    # 7c) Exclude specific hrefs if requested
-    if args.exclude_href:
-        removed_n = drop_resources_by_href(tree, tmp, args.exclude_href)
+    # 7c) Exclude specific hrefs if requested (robust matcher)
+    if exclude_hrefs:
+        removed_n = drop_resources_by_href(tree, tmp, exclude_hrefs)
         if removed_n:
             save_manifest(tree, manifest_path)
             print(f"[EXCLUDE] removed resources by href match: {removed_n}")
@@ -1510,7 +1523,6 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
         rid = res.get('identifier') or '(unknown)'
 
         if not href:
-            # Remove completely href-less resources
             if resources_root is not None:
                 resources_root.remove(res)
                 dirty = True
@@ -1519,7 +1531,6 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
 
         tgt = (tmp / href)
 
-        # Flag anything that is HTML-like OR any directory target
         is_htmlish = href.lower().endswith(('.html', '.htm'))
         is_dir_or_missing = (not tgt.exists()) or tgt.is_dir()
 
@@ -1536,9 +1547,8 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
             if res is None:
                 continue
 
-            # Build a POSIX placeholder href (forward slashes)
             raw_rel = Path(href).with_suffix('.html')
-            placeholder_rel = "/".join(raw_rel.parts)  # ensure POSIX separators
+            placeholder_rel = "/".join(raw_rel.parts)
             placeholder_path = tmp / placeholder_rel
 
             placeholder_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1549,7 +1559,6 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
                 encoding='utf-8'
             )
 
-            # Point resource to placeholder and REPLACE file children to avoid stale refs
             res.set('href', placeholder_rel)
             for f in list(res.findall('{*}file')):
                 res.remove(f)
@@ -1564,47 +1573,39 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
     # 13D) Prune <item> nodes whose identifierref points to a missing <resource>
     def prune_items_with_missing_resources(tree: ET.ElementTree) -> tuple[int, int]:
         root = tree.getroot()
-        # Set of valid resource identifiers
         valid_res_ids = {
             r.get("identifier") for r in root.findall(".//{*}resource")
             if r.get("identifier")
         }
 
         removed_items = 0
-        removed_empty_items = 0  # containers with no children and no identifierref
+        removed_empty_items = 0
 
         def prune_item_children(parent_el):
             nonlocal removed_items, removed_empty_items
-            # Iterate over a static list of children because we'll mutate the parent
             for child in list(parent_el):
-                tag = child.tag.rsplit('}', 1)[-1]  # localname
+                tag = child.tag.rsplit('}', 1)[-1]
                 if tag == "item":
-                    # Recurse before deciding to keep/remove this child
                     prune_item_children(child)
 
                     ref = (child.get("identifierref") or "").strip()
                     has_children = any(grand.tag.rsplit('}',1)[-1] == "item" for grand in child)
 
-                    # Remove if it references a missing resource
                     if ref and ref not in valid_res_ids:
                         parent_el.remove(child)
                         removed_items += 1
                         continue
 
-                    # Remove empty containers: no identifierref and no child <item>
                     if (not ref) and (not has_children):
                         parent_el.remove(child)
                         removed_empty_items += 1
                         continue
-                # else: leave non-<item> nodes alone
 
-        # Prune under each organization
         for org in root.findall(".//{*}organization"):
             prune_item_children(org)
 
         return removed_items, removed_empty_items
 
-    # --- run pruner & log ---
     pruned_refs, pruned_empty = prune_items_with_missing_resources(tree)
     if pruned_refs or pruned_empty:
         print(f"[ORG] removed items referencing missing resources: {pruned_refs}")
@@ -1616,10 +1617,6 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
         path.parent.mkdir(parents=True, exist_ok=True)
 
     def normalize_resource_hrefs(tree: ET.ElementTree, tmp: Path) -> tuple[int, int]:
-        """
-        Canonicalize *all* resource hrefs to URL-encoded form and ensure the encoded file exists.
-        Align the single <file href> to match. This hits images, PDFs, zips, etc.
-        """
         changed_href = 0
         created_files = 0
         root = tree.getroot()
@@ -1629,7 +1626,6 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
             if not href:
                 continue
 
-            # Canonical encoded target
             enc = urllib.parse.quote(urllib.parse.unquote(href), safe="/-_.~")
             if enc != href:
                 res.set("href", enc)
@@ -1637,11 +1633,10 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
 
             dst = tmp / enc
             if not dst.exists():
-                # Try plausible source variants
                 candidates = [
-                    tmp / urllib.parse.unquote(href),  # decoded of original
-                    tmp / href,                        # original as-is
-                    tmp / urllib.parse.unquote(enc),   # decoded of encoded
+                    tmp / urllib.parse.unquote(href),
+                    tmp / href,
+                    tmp / urllib.parse.unquote(enc),
                 ]
                 for src in candidates:
                     try:
@@ -1652,10 +1647,8 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
                             created_files += 1
                             break
                     except Exception:
-                        # fallthrough to try next candidate
                         pass
                 else:
-                    # As a last resort, create a tiny placeholder (rare)
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     dst.write_text(
                         f"<html><body><p>Auto-generated placeholder for missing target: "
@@ -1664,13 +1657,11 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
                     )
                     created_files += 1
 
-            # Align a single <file href> child to the encoded href
             f = res.find("{*}file")
             if f is None:
                 f = ET.SubElement(res, "{http://www.imsglobal.org/xsd/imscp_v1p1}file")
             f.set("href", enc)
 
-            # Remove any extra <file> elements that don't match the encoded href
             for extra in list(res.findall("{*}file")):
                 if extra is not f and (extra.get("href") or "").strip() != enc:
                     res.remove(extra)
@@ -1678,24 +1669,15 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
         return changed_href, created_files
 
     def enforce_decoded_payload(tree: ET.ElementTree, tmp: Path) -> tuple[int,int,int]:
-        """
-        Ensure every referenced resource exists on disk at its *decoded* path.
-        - If only encoded exists -> move to decoded.
-        - If both exist -> delete encoded, keep decoded.
-        - If neither exists -> create a small placeholder at decoded.
-        Returns (moved_enc_to_dec, removed_encoded_dupes, created_placeholders).
-        """
         moved = removed = created = 0
         root = tree.getroot()
 
-        # Helper to normalize any href-like string
         def enc_and_dec(rel: str) -> tuple[Path, Path, str, str]:
             rel = (rel or "").strip()
             enc = urllib.parse.quote(urllib.parse.unquote(rel), safe="/-_.~")
             dec = urllib.parse.unquote(enc)
             return (tmp / enc, tmp / dec, enc, dec)
 
-        # Walk both <resource href> and <file href> to cover everything we reference
         hrefs: set[str] = set()
         for res in root.findall(".//{*}resource"):
             h = (res.get("href") or "").strip()
@@ -1709,10 +1691,8 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
         for h in sorted(hrefs):
             enc_abs, dec_abs, enc, dec = enc_and_dec(h)
 
-            # Case 1: encoded exists, decoded missing -> move (rename) encoded -> decoded
             if enc_abs.exists() and not dec_abs.exists():
                 dec_abs.parent.mkdir(parents=True, exist_ok=True)
-                # Use move if same filesystem; copy+unlink otherwise (Path.rename throws across FS)
                 try:
                     enc_abs.rename(dec_abs)
                 except Exception:
@@ -1724,7 +1704,6 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
                 moved += 1
                 continue
 
-            # Case 2: both exist -> delete the encoded duplicate
             if enc_abs.exists() and dec_abs.exists():
                 try:
                     enc_abs.unlink()
@@ -1733,7 +1712,6 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
                     pass
                 continue
 
-            # Case 3: neither exists -> create placeholder at decoded
             if not enc_abs.exists() and not dec_abs.exists():
                 dec_abs.parent.mkdir(parents=True, exist_ok=True)
                 dec_abs.write_text(
@@ -1762,7 +1740,6 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
     # 15) Print summary
     log.print_summary()
 
-    # Cleanup temp directory
     shutil.rmtree(tmp, ignore_errors=True)
 
     print(f"Output written to: {out_path}")
@@ -1778,8 +1755,12 @@ def main():
     parser.add_argument('--tf-to-mc-fallback', action='store_true',
     help="If a True/False item can't be normalized, convert it to a 2-option Multiple Choice.")
     parser.add_argument('--exclude', type=str, default='', help="Comma-separated kinds to drop instead of converting. " "Supported kinds: qti, webcontent, discussion, weblink, file, page")
+    # PATCH: clarified help; still action=append and default=[]
     parser.add_argument('--exclude-href', action='append', default=[],
-    help='Exact href or path suffix to remove (may be repeated). Example: --exclude-href web_resources/Uploaded%20Media/EItAcdPP-kk%281%29.jpg')
+    help=('Exact href OR path suffix to remove (repeatable). '
+          'Handles encoding and separators automatically. Examples:\n'
+          '  --exclude-href web_resources/Uploaded%20Media/EItAcdPP-kk%281%29.jpg\n'
+          '  --exclude-href "web_resources/Uploaded Media/EItAcdPP-kk(1).jpg"'))
     args = parser.parse_args()
     exclude_kinds = {k.strip().lower() for k in (args.exclude.split(',') if args.exclude else []) if k.strip()}
 
@@ -1801,15 +1782,18 @@ def main():
         outdir = Path(raw)
 
     try:
-        process_cartridge(imscc, outdir, tf_to_mc_fallback=args.tf_to_mc_fallback, exclude_kinds=exclude_kinds)
+        # PATCH: pass exclude_hrefs into process_cartridge (no global args usage)
+        process_cartridge(
+            imscc,
+            outdir,
+            tf_to_mc_fallback=args.tf_to_mc_fallback,
+            exclude_kinds=exclude_kinds,
+            exclude_hrefs=args.exclude_href
+        )
 
     except Exception as e:
         print(f"FAILED: {e}", file=sys.stderr)
         sys.exit(1)
-
-if __name__ == '__main__':
-    main()
-
 
 def iter_all_qti_files(extracted_dir: Path):
     # Standard CC assessments
@@ -1819,51 +1803,86 @@ def iter_all_qti_files(extracted_dir: Path):
     for p in extracted_dir.rglob('non_cc_assessments/*.xml.qti'):
         yield p
 
-def drop_resources_by_href(tree: ET.ElementTree, tmp: Path, href_terms: list[str]) -> int:
+# PATCH: hardened matcher — encoding/decoding & path-separator resilient
+def drop_resources_by_href(tree: ET.ElementTree, tmp: Path, href_terms: List[str]) -> int:
     """
-    Remove any <resource> whose @href or any <file href> exactly matches one of the given strings,
-    OR ends with one of them (suffix match). Prunes org <item> refs and <dependency> refs as well.
+    Remove any <resource> whose @href or any <file href> equals OR ends with one of the given
+    strings. Matching is resilient to:
+      • URL encoding (%28/%29 vs '(' ')')
+      • Double-encoding in input terms (e.g., %2528)
+      • Path separators (Windows '\\' vs POSIX '/')
     """
-    if not href_terms: return 0
-    terms = [t.strip() for t in href_terms if t and t.strip()]
-    root = tree.getroot()
-    resources_parent = root.find('.//{*}resources')
-    if resources_parent is None: return 0
+    if not href_terms:
+        return 0
+
+    def canonical_variants(s: str) -> Set[str]:
+        # Normalize slashes early
+        raw = (s or "").replace("\\", "/").strip()
+
+        # Decode once (Moodle behavior) and again in case of double-encoding
+        dec1 = urllib.parse.unquote(raw)
+        dec2 = urllib.parse.unquote(dec1)
+
+        # Canonical encoded (keeps () encoded; safe="/-_.~")
+        enc1 = urllib.parse.quote(dec2, safe="/-_.~")
+
+        return {
+            raw,
+            dec1.replace("\\", "/"),
+            dec2.replace("\\", "/"),
+            enc1.replace("\\", "/"),
+        }
+
+    wanted: Set[str] = set()
+    for t in href_terms:
+        wanted |= canonical_variants(t)
+
+    def norm(h: str) -> str:
+        return (h or "").replace("\\", "/").strip()
 
     def match(h: str) -> bool:
-        if not h: return False
-        return any(h == t or h.endswith(t) for t in terms)
+        if not h:
+            return False
+        # Generate variants for the candidate path too
+        cand_vars = canonical_variants(norm(h))
+        return any((hv == tv) or hv.endswith(tv) for hv in cand_vars for tv in wanted)
 
-    to_remove_ids = set()
+    root = tree.getroot()
+    resources_parent = root.find('.//{*}resources')
+    if resources_parent is None:
+        return 0
+
+    to_remove_ids: Set[str] = set()
+
     for res in list(resources_parent.findall('{*}resource')):
-        href = (res.get('href') or '').strip()
-        files = [ (f.get('href') or '').strip() for f in res.findall('{*}file') ]
+        href = norm(res.get('href') or '')
+        files = [norm((f.get('href') or '')) for f in res.findall('{*}file')]
         if match(href) or any(match(fh) for fh in files):
             to_remove_ids.add(res.get('identifier') or 'UNKNOWN')
 
-    if not to_remove_ids: return 0
+    if not to_remove_ids:
+        return 0
 
-    # remove resources
+    # Remove <resource> nodes
     for res in list(resources_parent.findall('{*}resource')):
         if (res.get('identifier') or '') in to_remove_ids:
             resources_parent.remove(res)
 
-    # prune org items
+    # Prune <item> references under <organizations>
     for org in root.findall('.//{*}organization'):
         for parent in list(org.iter()):
             for child in list(parent):
                 if child.tag.endswith('item') and (child.get('identifierref') in to_remove_ids):
                     parent.remove(child)
 
-    # prune dependencies
+    # Prune <dependency> references
     for res in root.findall('.//{*}resource'):
         for dep in list(res.findall('{*}dependency')):
             if dep.get('identifierref') in to_remove_ids:
                 res.remove(dep)
 
-    # also try to delete the files from the payload
-    for rid in to_remove_ids:
-        # best-effort: remove all files under a folder named like the resource href’s dir
-        pass  # (optional—generally safe to leave files; Moodle ignores unreferenced payload)
-
+    # Payload cleanup is optional; safe to leave orphan files.
     return len(to_remove_ids)
+
+if __name__ == '__main__':
+    main()
