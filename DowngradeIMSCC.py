@@ -1169,18 +1169,22 @@ def remove_empty_qti_assessments(tree: ET.ElementTree, base_folder: Path) -> int
 
     return len(empty_ids)      
 
-
 def sanitize_html_like_resources(tree: ET.ElementTree, base_folder: Path) -> Tuple[int, int]:
     """
-    Ensure every page-like resource points to a non-empty HTML file.
+    Ensure every page-like resource points to a non-empty HTML file and that
+    hrefs are canonical (percent-encoded) while BOTH encoded/decoded files exist.
+
     Page-like if:
       • resource@href ends with .html/.htm (case-insensitive), OR
       • href resolves to a DIRECTORY, OR
       • resource@type contains 'webcontent' or 'learning-application-resource'
-    If missing/empty/dir/non-HTML, create a placeholder and repoint.
+
+    If missing/empty/dir/non-HTML, create a placeholder/sidecar HTML and repoint.
     If there is no href anywhere, remove the resource.
     Returns (removed_count, patched_count).
     """
+    import os, shutil, urllib.parse
+
     print("[DEBUG] entered sanitize_html_like_resources")
     root = tree.getroot()
     resources_parent = root.find('.//{*}resources')
@@ -1189,6 +1193,72 @@ def sanitize_html_like_resources(tree: ET.ElementTree, base_folder: Path) -> Tup
         return (0, 0)
 
     removed, patched = 0, 0
+
+    # ---------- helpers ----------
+    def canonicalize_href(h: str) -> str:
+        # Percent-encode everything except path separators and the usual URL-safe set.
+        # NOTE: we intentionally DO NOT mark parentheses as safe.
+        import urllib.parse
+        return urllib.parse.quote(urllib.parse.unquote(h), safe="/-_.~()")
+
+    def ensure_both_paths(workdir: Path, relpath: str) -> str:
+        """
+        Make sure both encoded and decoded copies exist on disk.
+        Returns the encoded (canonical) relative path for manifest.
+        Handles over-encoded segments like '%2520' by probing variants.
+        """
+        # decoded (with spaces / literal parens)
+        dec = urllib.parse.unquote(relpath)
+        # encoded canonical (spaces->%20, keep () unencoded)
+        enc = canonicalize_href(relpath)
+
+        dec_abs = workdir / dec
+        enc_abs = workdir / enc
+
+        # If one exists, mirror it to the other.
+        if dec_abs.exists() and not enc_abs.exists():
+            enc_abs.parent.mkdir(parents=True, exist_ok=True)
+            if os.path.abspath(enc_abs) != os.path.abspath(dec_abs):
+                shutil.copy2(enc_abs, dec_abs)
+            return enc
+
+        if enc_abs.exists() and not dec_abs.exists():
+            dec_abs.parent.mkdir(parents=True, exist_ok=True)
+            if os.path.abspath(enc_abs) != os.path.abspath(dec_abs):
+                shutil.copy2(enc_abs, dec_abs)
+            return enc
+
+        # Neither exists → try to rescue from a double-encoded path (e.g., '%2520' for '%20').
+        dec2 = urllib.parse.unquote(dec)          # unquote twice
+        enc2 = canonicalize_href(dec2)            # canonicalize that form too
+
+        candidates = [
+            workdir / relpath,                    # as-is
+            workdir / urllib.parse.unquote(relpath),
+            workdir / urllib.parse.unquote(urllib.parse.unquote(relpath)),
+            workdir / enc2,                       # encoded of the twice-decoded
+        ]
+
+        src = next((p for p in candidates if p.exists()), None)
+        if src is not None:
+            # Copy from the discovered source to both canonical locations.
+            dec_abs.parent.mkdir(parents=True, exist_ok=True)
+            enc_abs.parent.mkdir(parents=True, exist_ok=True)
+            if os.path.abspath(enc_abs) != os.path.abspath(dec_abs):
+                shutil.copy2(enc_abs, dec_abs)
+            return enc
+
+        # Still nothing → create a tiny placeholder at the encoded path.
+        enc_abs.parent.mkdir(parents=True, exist_ok=True)
+        enc_abs.write_bytes(
+            b"<!doctype html><meta charset='utf-8'>"
+            b"<title>Missing file</title><p>Placeholder created by downgrade tool.</p>"
+        )
+        # Mirror placeholder to decoded too.
+        dec_abs.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.abspath(enc_abs) != os.path.abspath(dec_abs):
+            shutil.copy2(enc_abs, dec_abs)
+        return enc
 
     def _is_page_like(res: ET.Element) -> bool:
         rtype = (res.get('type') or '').lower()
@@ -1201,70 +1271,97 @@ def sanitize_html_like_resources(tree: ET.ElementTree, base_folder: Path) -> Tup
         if href:
             return href
         f = res.find('{*}file')
-        if f is not None and (f.get('href') or '').strip():
-            return (f.get('href') or '').strip()
+        if f is not None:
+            fh = (f.get('href') or '').strip()
+            if fh:
+                return fh
         return ''
 
     def _write_placeholder_html(path: Path, title: str):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            f"<html><body><h1>{title}</h1>"
-            f"<p>Placeholder content generated during downgrade.</p></body></html>",
+            f"<!doctype html><meta charset='utf-8'><title>{title}</title>"
+            f"<h1>{title}</h1><p>Placeholder content generated during downgrade.</p>",
             encoding="utf-8"
         )
 
-    def _point_res_to(res: ET.Element, rel_href: str):
-        # Set primary href; ensure a matching <file href="..."> exists (Canvas/Moodle are happiest this way)
-        res.set('href', rel_href)
+    def _point_res_to(res: ET.Element, rel_href_canonical: str):
+        """
+        Set primary href and ensure a matching <file href="..."> exists.
+        rel_href_canonical MUST be encoded (canonical) form.
+        """
+        res.set('href', rel_href_canonical)
         file_el = res.find('{*}file')
         if file_el is None:
-            file_el = ET.SubElement(res, '{http://www.imsglobal.org/xsd/imscp_v1p1}file')
-        file_el.set('href', rel_href)
+            # derive namespace from resource tag to stay within imscp
+            ns = res.tag.split('}')[0].strip('{')
+            file_el = ET.SubElement(res, f'{{{ns}}}file')
+        file_el.set('href', rel_href_canonical)
 
-    # Iterate defensively over a copy
+    # ---------- main pass ----------
     for res in list(root.findall('.//{*}resource')):
         if not _is_page_like(res):
             continue
 
-        href = _first_href(res)
+        href_raw = _first_href(res)
         rid = res.get('identifier') or '(unknown)'
 
         # No href anywhere → remove resource to avoid Moodle loadHTML("") crash
-        if not href:
+        if not href_raw:
             resources_parent.remove(res)
             removed += 1
             print(f"[MANIFEST] html fix: removed page-like resource with no href (id={rid})")
             continue
 
-        target = (base_folder / href)
-        # Directory or missing file → write placeholder & repoint (keep structure stable)
-        if (not target.exists()) or target.is_dir():
-            placeholder_rel = Path(href).with_suffix('.html')
-            placeholder_path = (base_folder / placeholder_rel)
-            _write_placeholder_html(placeholder_path, f"Resource {rid}")
-            _point_res_to(res, str(placeholder_rel))
+        # Paths: prefer existing decoded/encoded if either already present
+        dec_rel = Path(urllib.parse.unquote(href_raw))
+        enc_rel = Path(canonicalize_href(href_raw))
+
+        dec_path = base_folder / dec_rel
+        enc_path = base_folder / enc_rel
+
+        exists = dec_path.exists() or enc_path.exists()
+        is_dir = (dec_path.exists() and dec_path.is_dir()) or (enc_path.exists() and enc_path.is_dir())
+
+        # Directory or missing file → write placeholder & repoint
+        if (not exists) or is_dir:
+            placeholder_dec = dec_rel.with_suffix('.html')
+            placeholder_abs = base_folder / placeholder_dec
+            _write_placeholder_html(placeholder_abs, f"Resource {rid}")
+
+            canon_final = ensure_both_paths(base_folder, str(placeholder_dec))
+            _point_res_to(res, canon_final)
             patched += 1
-            print(f"[MANIFEST] html fix: wrote placeholder for {rid} -> {placeholder_rel}")
+            print(f"[MANIFEST] html fix: wrote placeholder for {rid} -> {placeholder_dec}")
             continue
 
-        # File exists but clearly non-HTML? (e.g., no .html/.htm extension)
-        if not href.lower().endswith(('.html', '.htm')):
-            # Keep original file, create sidecar HTML that links to it, then point to the HTML
-            sidecar_rel = Path(href).with_suffix('.html')
-            sidecar_path = (base_folder / sidecar_rel)
-            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-            sidecar_path.write_text(
-                f"<html><body><h1>Resource {rid}</h1>"
-                f"<p>This item referenced a non-HTML file: <code>{href}</code>.</p>"
-                f"</body></html>",
+        # We have a file; if it's NOT .html/.htm, create a sidecar HTML and point to it
+        if dec_rel.suffix.lower() not in ('.html', '.htm') and enc_rel.suffix.lower() not in ('.html', '.htm'):
+            sidecar_dec = dec_rel.with_suffix('.html')  # create beside original (decoded name)
+            sidecar_abs = base_folder / sidecar_dec
+            sidecar_abs.parent.mkdir(parents=True, exist_ok=True)
+            sidecar_abs.write_text(
+                f"<!doctype html><meta charset='utf-8'><title>Resource {rid}</title>"
+                f"<h1>Resource {rid}</h1>"
+                f"<p>This item referenced a non-HTML file: <code>{urllib.parse.unquote(href_raw)}</code>.</p>",
                 encoding='utf-8'
             )
-            _point_res_to(res, str(sidecar_rel))
+            canon_final = ensure_both_paths(base_folder, str(sidecar_dec))
+            _point_res_to(res, canon_final)
             patched += 1
-            print(f"[MANIFEST] html fix: added sidecar HTML for {rid} -> {sidecar_rel}")
+            print(f"[MANIFEST] html fix: added sidecar HTML for {rid} -> {sidecar_dec}")
+            continue
+
+        # Already HTML: just canonicalize + ensure both filesystem copies exist
+        canon_final = ensure_both_paths(base_folder, str(dec_rel))
+        if canon_final != href_raw:
+            patched += 1
+            print(f"[MANIFEST] html fix: canonicalized href for {rid} -> {canon_final}")
+        _point_res_to(res, canon_final)
 
     print(f"[DEBUG] exiting sanitize_html_like_resources removed={removed}, patched={patched}")
     return (removed, patched)
+
 
 
 def audit_html_resources(tree: ET.ElementTree, base_folder: Path) -> None:
@@ -1345,7 +1442,8 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
         output_dir.mkdir(parents=True, exist_ok=True)
         dest = output_dir / Path(input_zip.name)
         if str(input_zip.resolve()) != str(dest.resolve()):
-            shutil.copy2(input_zip, dest)
+            if os.path.abspath(enc_abs) != os.path.abspath(dec_abs):
+                shutil.copy2(enc_abs, dec_abs)
         print(f"Output written to: {dest}")
         return dest
 
@@ -1615,7 +1713,67 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
     if href_updates or copies:
         print(f"[ENCODE] hrefs updated: {href_updates}, files created/copied: {copies}")
         save_manifest(tree, manifest_path)
-        
+    
+    # 13F) Moodle-readability guard: ensure decoded-first path exists and is non-empty HTML
+    import urllib.parse
+    from pathlib import Path
+    import xml.etree.ElementTree as ET
+
+    def ensure_nonempty_html(p: Path, label: str):
+        if not p.exists() or p.read_bytes().strip() == b"":
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(f"<html><body><p>Auto-generated placeholder for {label}</p></body></html>", encoding="utf-8")
+            return True
+        return False
+
+    def moodle_readability_guard(tree: ET.ElementTree, tmpdir: Path) -> tuple[int,int]:
+        fixed_missing = 0
+        fixed_empty = 0
+        root = tree.getroot()
+        for r in root.findall(".//{*}resource"):
+            rtype=(r.get("type") or "").lower()
+            if "webcontent" not in rtype:
+                continue
+
+            fchild = r.find("{*}file")
+            href = (fchild.get("href") if fchild is not None else r.get("href") or "").strip()
+            if not href:
+                continue
+
+            decoded = urllib.parse.unquote(href)
+            raw = href
+
+            decoded_path = tmpdir / decoded
+            raw_path = tmpdir / raw
+
+            # If Moodle's decoded path doesn't exist but the raw one does, copy it to the decoded path.
+            if not decoded_path.exists() and raw_path.exists():
+                decoded_path.parent.mkdir(parents=True, exist_ok=True)
+                decoded_path.write_bytes(raw_path.read_bytes())
+                fixed_missing += 1
+
+            # Ensure the *decoded* path exists and is non-empty (this is what Moodle tries first)
+            if ensure_nonempty_html(decoded_path, decoded):
+                fixed_empty += 1
+
+            # Align the <file href> to the decoded path so manifest matches Moodle lookup
+            target_href = decoded
+            if fchild is None:
+                fchild = ET.SubElement(r, "{http://www.imsglobal.org/xsd/imscp_v1p1}file")
+            fchild.set("href", target_href)
+            r.set("href", target_href)  # keep resource@href in sync
+
+            # Remove any extra <file> children that don't match target
+            for extra in list(r.findall("{*}file")):
+                if extra is not fchild and (extra.get("href") or "") != target_href:
+                    r.remove(extra)
+
+        return fixed_missing, fixed_empty
+
+    miss, empt = moodle_readability_guard(tree, tmp)
+    print(f"[MOODLE-GUARD] created decoded-path copies: {miss}, ensured non-empty html files: {empt}")
+    save_manifest(tree, manifest_path)
+    
     # 14) Write output zip (.imscc)
     out_name = input_zip.stem + '-cc11.imscc'
     out_path = (output_dir / out_name).with_suffix('.imscc')
@@ -1666,7 +1824,6 @@ def main():
     except Exception as e:
         print(f"FAILED: {e}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == '__main__':
     main()
