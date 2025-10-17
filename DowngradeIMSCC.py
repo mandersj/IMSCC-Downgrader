@@ -1501,59 +1501,121 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
         save_manifest(tree, manifest_path)
     
     # 13D) Prune <item> nodes whose identifierref points to a missing <resource>
-    def prune_items_with_missing_resources(tree: ET.ElementTree) -> tuple[int, int, int]:
+    def prune_items_with_missing_resources(tree: ET.ElementTree) -> tuple[int, int]:
         root = tree.getroot()
-        resources = {r.get("identifier") for r in root.findall(".//{*}resource") if r.get("identifier")}
+        # Set of valid resource identifiers
+        valid_res_ids = {
+            r.get("identifier") for r in root.findall(".//{*}resource")
+            if r.get("identifier")
+        }
+
         removed_items = 0
-        removed_empty_containers = 0
+        removed_empty_items = 0  # containers with no children and no identifierref
 
-        # Helper: remove child from its parent (xml.etree has no getparent())
-        def _remove_child(parent_path: str, child):
-            parent = None
-            # Search both organizations and items as potential parents
-            for p in root.findall(parent_path):
-                for c in list(p):
-                    if c is child:
-                        parent = p
-                        p.remove(c)
-                        return parent
-            return None
+        def prune_item_children(parent_el):
+            nonlocal removed_items, removed_empty_items
+            # Iterate over a static list of children because we'll mutate the parent
+            for child in list(parent_el):
+                tag = child.tag.rsplit('}', 1)[-1]  # localname
+                if tag == "item":
+                    # Recurse before deciding to keep/remove this child
+                    prune_item_children(child)
 
-        # 1) Remove dangling items
-        for itm in list(root.findall(".//{*}item")):
-            ref = itm.get("identifierref")
-            if ref and ref not in resources:
-                _remove_child(".//{*}item|.//{*}organization", itm)
-                removed_items += 1
+                    ref = (child.get("identifierref") or "").strip()
+                    has_children = any(grand.tag.rsplit('}',1)[-1] == "item" for grand in child)
 
-        # 2) Remove empty item containers (items with no child items and no identifierref)
-        changed = True
-        while changed:
-            changed = False
-            for itm in list(root.findall(".//{*}item")):
-                has_children = any(child.tag.endswith("item") for child in itm)
-                has_ref = bool(itm.get("identifierref"))
-                if (not has_children) and (not has_ref):
-                    parent = _remove_child(".//{*}item|.//{*}organization", itm)
-                    if parent is not None:
-                        removed_empty_containers += 1
-                        changed = True
+                    # Remove if it references a missing resource
+                    if ref and ref not in valid_res_ids:
+                        parent_el.remove(child)
+                        removed_items += 1
+                        continue
 
-        # 3) Remove empty <organization> nodes
-        for org in list(root.findall(".//{*}organization")):
-            if not any(True for _ in org.findall(".//{*}item")):
-                parent = _remove_child(".//{*}organizations", org)
-                if parent is not None:
-                    removed_empty_containers += 1
+                    # Remove empty containers: no identifierref and no child <item>
+                    if (not ref) and (not has_children):
+                        parent_el.remove(child)
+                        removed_empty_items += 1
+                        continue
+                # else: leave non-<item> nodes alone
 
-        return removed_items, removed_empty_containers, len(resources)
+        # Prune under each organization
+        for org in root.findall(".//{*}organization"):
+            prune_item_children(org)
 
-    pruned_items, pruned_containers, _ = prune_items_with_missing_resources(tree)
-    if pruned_items or pruned_containers:
-        print(f"[ORG] removed items referencing missing resources: {pruned_items}")
-        print(f"[ORG] removed empty containers/organizations: {pruned_containers}")
+        return removed_items, removed_empty_items
+
+    # --- run pruner & log ---
+    pruned_refs, pruned_empty = prune_items_with_missing_resources(tree)
+    if pruned_refs or pruned_empty:
+        print(f"[ORG] removed items referencing missing resources: {pruned_refs}")
+        print(f"[ORG] removed empty item containers: {pruned_empty}")
         save_manifest(tree, manifest_path)
 
+    # 13E) Normalize hrefs to URL-encoded paths and ensure files exist
+    import urllib.parse
+
+    def ensure_parent_dir(path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    def normalize_resource_hrefs(tree: ET.ElementTree, tmp: Path) -> tuple[int, int]:
+        """
+        URL-encode resource hrefs (spaces, etc.) and ensure encoded copies exist on disk.
+        Also align <file href> to the encoded value.
+        """
+        changed_href = 0
+        created_files = 0
+        root = tree.getroot()
+
+        for res in root.findall(".//{*}resource"):
+            href = (res.get("href") or "").strip()
+            if not href:
+                continue
+
+            # Only bother for HTML-ish or webcontent-ish
+            rtype = (res.get("type") or "").lower()
+            is_htmlish = href.lower().endswith((".html", ".htm")) or "webcontent" in rtype
+
+            if not is_htmlish:
+                continue
+
+            enc = urllib.parse.quote(href, safe="/-_.~")
+            if enc != href:
+                # point manifest to encoded path
+                res.set("href", enc)
+                changed_href += 1
+
+            src = tmp / href
+            dst = tmp / enc
+
+            # If encoded target doesn't exist, create it (copy if src exists; else fallback to small placeholder)
+            if not dst.exists():
+                ensure_parent_dir(dst)
+                if src.exists() and src.is_file():
+                    dst.write_bytes(src.read_bytes())
+                else:
+                    dst.write_text(
+                        f"<html><body><p>Auto-generated placeholder for missing target: <code>{enc}</code></p></body></html>",
+                        encoding="utf-8",
+                    )
+                created_files += 1
+
+            # Align <file> child to the encoded href (single file entry)
+            f = res.find("{*}file")
+            if f is None:
+                f = ET.SubElement(res, "{http://www.imsglobal.org/xsd/imscp_v1p1}file")
+            f.set("href", enc)
+
+            # Remove any extra <file> children that don't match the encoded href
+            for extra in list(res.findall("{*}file")):
+                if extra is not f and (extra.get("href") or "").strip() != enc:
+                    res.remove(extra)
+
+        return changed_href, created_files
+
+    href_updates, copies = normalize_resource_hrefs(tree, tmp)
+    if href_updates or copies:
+        print(f"[ENCODE] hrefs updated: {href_updates}, files created/copied: {copies}")
+        save_manifest(tree, manifest_path)
+        
     # 14) Write output zip (.imscc)
     out_name = input_zip.stem + '-cc11.imscc'
     out_path = (output_dir / out_name).with_suffix('.imscc')
