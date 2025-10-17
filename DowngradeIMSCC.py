@@ -966,6 +966,148 @@ def _qti_item_count(xml_path: Path) -> int:
         return 0
     return len(root.findall('.//{*}item'))
 
+# ----------------------------- Exclude kinds --------------------------------
+
+def _res_targets(base_folder: Path, res: ET.Element) -> List[Path]:
+    t: List[Path] = []
+    href = res.get('href')
+    if href:
+        t.append(base_folder / href)
+    for f in res.findall('{*}file'):
+        fh = f.get('href')
+        if fh:
+            t.append(base_folder / fh)
+    return t
+
+def is_qti_resource(res: ET.Element, base_folder: Path) -> bool:
+    rtype = (res.get('type') or '').lower()
+    if 'imsqti' in rtype:
+        return True
+    for p in _res_targets(base_folder, res):
+        s = p.suffix.lower()
+        if p.name.endswith('assessment_qti.xml') or p.name.endswith('.xml.qti'):
+            return True
+        if s == '.xml':
+            try:
+                txt = p.read_text(encoding='utf-8', errors='ignore').lower()
+                if 'questestinterop' in txt or 'imsqti_v2' in txt:
+                    return True
+            except Exception:
+                pass
+    return False
+
+def is_weblink_resource(res: ET.Element, base_folder: Path) -> bool:
+    rtype = (res.get('type') or '').lower()
+    if 'imswl' in rtype:  # weblink descriptor
+        return True
+    for p in _res_targets(base_folder, res):
+        if p.suffix.lower() == '.xml':
+            try:
+                txt = p.read_text(encoding='utf-8', errors='ignore').lower()
+                if 'imswl_v1p' in txt:
+                    return True
+            except Exception:
+                pass
+    return False
+
+def is_discussion_resource(res: ET.Element, base_folder: Path) -> bool:
+    rtype = (res.get('type') or '').lower()
+    if 'imsdt' in rtype:  # discussion topic descriptor
+        return True
+    for p in _res_targets(base_folder, res):
+        if p.suffix.lower() == '.xml':
+            try:
+                txt = p.read_text(encoding='utf-8', errors='ignore').lower()
+                if 'imsdt_v1p' in txt:
+                    return True
+            except Exception:
+                pass
+    return False
+
+def is_webcontent_page(res: ET.Element, base_folder: Path) -> bool:
+    rtype = (res.get('type') or '').lower()
+    if not (
+        'webcontent' in rtype
+        or 'learning-application-resource' in rtype
+        or rtype == 'imscc_xmlv1p1/learning-application-resource'
+        or rtype == 'associatedcontent/imscc_xmlv1p1/learning-application-resource'
+        or rtype == 'associatedcontent/imscc_xmlv1p1/webcontent'
+    ):
+        return False
+    href = res.get('href') or ''
+    return href.lower().endswith(('.html', '.htm'))
+
+def is_file_resource(res: ET.Element, base_folder: Path) -> bool:
+    # very loose: non-QTI, non-weblink/discussion, non-page webcontent
+    if is_qti_resource(res, base_folder): return False
+    if is_weblink_resource(res, base_folder): return False
+    if is_discussion_resource(res, base_folder): return False
+    if is_webcontent_page(res, base_folder): return False
+    return True
+
+def drop_resources_by_kind(tree: ET.ElementTree, base_folder: Path, kinds: Set[str]) -> Dict[str, int]:
+    """
+    kinds: subset of {'qti','webcontent','discussion','weblink','file','page'}
+    Returns counts dict.
+    """
+    root = tree.getroot()
+    resources_parent = root.find('.//{*}resources')
+    counts = {'qti':0, 'webcontent':0, 'discussion':0, 'weblink':0, 'file':0, 'page':0}
+    if resources_parent is None or not kinds:
+        return counts
+
+    # collect ids to remove
+    to_remove_ids: Set[str] = set()
+    for res in list(resources_parent.findall('{*}resource')):
+        rid = res.get('identifier') or 'UNKNOWN'
+        hit = None
+        if 'qti' in kinds and is_qti_resource(res, base_folder):
+            hit = 'qti'
+        elif 'discussion' in kinds and is_discussion_resource(res, base_folder):
+            hit = 'discussion'
+        elif 'weblink' in kinds and is_weblink_resource(res, base_folder):
+            hit = 'weblink'
+        elif 'page' in kinds and is_webcontent_page(res, base_folder):
+            hit = 'page'
+        elif 'webcontent' in kinds:
+            rtype = (res.get('type') or '').lower()
+            if ('webcontent' in rtype) or ('learning-application-resource' in rtype) \
+               or rtype in {
+                   'imscc_xmlv1p1/learning-application-resource',
+                   'associatedcontent/imscc_xmlv1p1/learning-application-resource',
+                   'associatedcontent/imscc_xmlv1p1/webcontent'
+               }:
+                hit = 'webcontent'
+        elif 'file' in kinds and is_file_resource(res, base_folder):
+            hit = 'file'
+
+        if hit:
+            to_remove_ids.add(rid)
+            counts[hit] = counts.get(hit, 0) + 1
+
+    if not to_remove_ids:
+        return counts
+
+    # remove resources
+    for res in list(resources_parent.findall('{*}resource')):
+        if (res.get('identifier') or '') in to_remove_ids:
+            resources_parent.remove(res)
+
+    # prune <item> references in organizations
+    for org in root.findall('.//{*}organization'):
+        for parent in list(org.iter()):
+            for child in list(parent):
+                if child.tag.endswith('item') and (child.get('identifierref') in to_remove_ids):
+                    parent.remove(child)
+
+    # prune <dependency> refs
+    for res in root.findall('.//{*}resource'):
+        for dep in list(res.findall('{*}dependency')):
+            if dep.get('identifierref') in to_remove_ids:
+                res.remove(dep)
+
+    return counts
+
 
 def remove_empty_qti_assessments(tree: ET.ElementTree, base_folder: Path) -> int:
     """
@@ -1032,7 +1174,7 @@ def sanitize_webcontent_resources(tree: ET.ElementTree, base_folder: Path) -> Tu
     Ensure every webcontent resource points to a real, non-empty HTML file.
     - If href is missing -> remove the resource and prune references.
     - If href file is missing or empty/whitespace -> create a small placeholder HTML and repoint.
-    Returns (removed_count, patched_count).
+    Returns (removed_count, patched_count).  NEVER returns None.
     """
     root = tree.getroot()
     resources_parent = root.find('.//{*}resources')
@@ -1055,17 +1197,22 @@ def sanitize_webcontent_resources(tree: ET.ElementTree, base_folder: Path) -> Tu
                 if dep.get('identifierref') in to_remove:
                     res.remove(dep)
 
+    # Process each resource
     for res in list(resources_parent.findall('{*}resource')):
         rtype = (res.get('type') or '').lower()
+
+        # Common Canvas/CC 1.1 shapes that Moodle maps to mod_resource (HTML page)
         is_webcontent = (
             'webcontent' in rtype
             or 'learning-application-resource' in rtype
-            or 'imscc_xmlv1p1/learning-application-resource' in rtype
-            or rtype.strip() == 'associatedcontent/imscc_xmlv1p1/learning-application-resource'
+            or rtype == 'imscc_xmlv1p1/learning-application-resource'
+            or rtype == 'associatedcontent/imscc_xmlv1p1/learning-application-resource'
+            or rtype == 'associatedcontent/imscc_xmlv1p1/webcontent'
         )
         if not is_webcontent:
             continue
-        rid = res.get('identifier') or 'UNKNOWN_RESOURCE_ID'
+
+        rid  = res.get('identifier') or 'UNKNOWN_RESOURCE_ID'
         href = res.get('href')
 
         if not href:
@@ -1085,14 +1232,14 @@ def sanitize_webcontent_resources(tree: ET.ElementTree, base_folder: Path) -> Tu
 
         if (not target.exists()) or (len(data.strip()) == 0):
             # create a minimal placeholder and repoint if needed
-            # keep it near original path when possible
             dst = target
-            if not target.parent.exists():
-                try:
+            try:
+                if not target.parent.exists():
                     target.parent.mkdir(parents=True, exist_ok=True)
-                except Exception:
-                    pass
-            # if target path is a folder or weird, park under a safe path
+            except Exception:
+                pass
+
+            # if target path is a folder or non-HTML, park under a safe path
             if target.is_dir() or target.suffix.lower() not in {'.html', '.htm'}:
                 dst = base_folder / f"{rid}_placeholder.html"
                 res.set('href', dst.relative_to(base_folder).as_posix())
@@ -1118,10 +1265,41 @@ def sanitize_webcontent_resources(tree: ET.ElementTree, base_folder: Path) -> Tu
     return (removed, patched)
 
 
-def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool = False) -> Path:
+def audit_html_resources(tree: ET.ElementTree, base_folder: Path) -> None:
+    root = tree.getroot()
+    offenders = []
+    for res in root.findall('.//{*}resource'):
+        rtype = (res.get('type') or '').lower()
+        href  = res.get('href') or ''
+        if not href:
+            continue
+        # Only HTML-like targets
+        if not href.lower().endswith(('.html', '.htm')):
+            continue
+        p = (base_folder / href)
+        if not p.exists():
+            offenders.append((res.get('identifier','?'), href, 'missing'))
+            continue
+        try:
+            data = p.read_text(encoding='utf-8', errors='ignore')
+        except Exception:
+            data = ''
+        if len(data.strip()) == 0:
+            offenders.append((res.get('identifier','?'), href, 'empty'))
+    if offenders:
+        print("[AUDIT] HTML resource files that are missing/empty:")
+        for rid, href, why in offenders[:50]:
+            print(f"  - {rid}: {href} ({why})")
+
+
+def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool = False, exclude_kinds: Optional[Set[str]] = None) -> Path:
+    # normalize paths (prevents write errors on rezip)
     input_zip = input_zip.resolve()
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # normalize exclude set
+    exclude_kinds = exclude_kinds or set()
 
     log = ChangeLog()
 
@@ -1168,11 +1346,19 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
 
     # 7) Remove LTI resources entirely (policy)
     removed_lti = remove_lti_resources(tree, tmp, log, res_id_to_titles)
-
     removed_any = set().union(removed_assign, removed_lti)
-
+    
+    # 7b) Optional: drop entire activity kinds instead of converting
+    if exclude_kinds:
+        dropped = drop_resources_by_kind(tree, tmp, exclude_kinds)
+        any_dropped = sum(dropped.values())
+        if any_dropped:
+            save_manifest(tree, manifest_path)
+            print(f"[EXCLUDE] dropped resources -> " +
+                  ", ".join(f"{k}:{v}" for k,v in dropped.items() if v))
+    
+    # 8) Remove items and dependencies referring to deleted resources
     if removed_any:
-        # 8) Remove items and dependencies referring to deleted resources
         remove_items_referring_to(tree, removed_any)
         remove_dependencies_referring_to(tree, removed_any)
 
@@ -1208,10 +1394,13 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
         print(f"[MANIFEST] removed empty QTI assessments: {removed_empty}")
 
     # 11e) sanitize webcontent (prevents DOMDocument->loadHTML on empty)
-    wc_removed, wc_patched = sanitize_webcontent_resources(tree, tmp)
+    _res_wc = sanitize_webcontent_resources(tree, tmp)
+    wc_removed, wc_patched = _res_wc if isinstance(_res_wc, tuple) else (0, 0)
+
     if wc_removed or wc_patched:
         save_manifest(tree, manifest_path)
         print(f"[MANIFEST] webcontent sanitized: removed={wc_removed}, patched={wc_patched}")
+    audit_html_resources(tree, tmp)
 
     # 12) Patch descriptor XMLs to reference v1p1 schemas instead of v1p2
     patch_descriptor_xmls(tmp, log)
@@ -1253,7 +1442,9 @@ def main():
     parser.add_argument('--output', '-o', type=str, help="Destination directory for downgraded .imscc")
     parser.add_argument('--tf-to-mc-fallback', action='store_true',
     help="If a True/False item can't be normalized, convert it to a 2-option Multiple Choice.")
+    parser.add_argument('--exclude', type=str, default='', help="Comma-separated kinds to drop instead of converting. " "Supported kinds: qti, webcontent, discussion, weblink, file, page")
     args = parser.parse_args()
+    exclude_kinds = {k.strip().lower() for k in (args.exclude.split(',') if args.exclude else []) if k.strip()}
 
     if args.input:
         input_path = Path(args.input)
@@ -1273,7 +1464,8 @@ def main():
         outdir = Path(raw)
 
     try:
-        process_cartridge(imscc, outdir, tf_to_mc_fallback=args.tf_to_mc_fallback)
+        process_cartridge(imscc, outdir, tf_to_mc_fallback=args.tf_to_mc_fallback, exclude_kinds=exclude_kinds)
+
     except Exception as e:
         print(f"FAILED: {e}", file=sys.stderr)
         sys.exit(1)
