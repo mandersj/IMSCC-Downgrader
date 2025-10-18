@@ -1169,127 +1169,147 @@ def remove_empty_qti_assessments(tree: ET.ElementTree, base_folder: Path) -> int
 
     return len(empty_ids)      
 
-def sanitize_webcontent_resources(tree: ET.ElementTree, base_folder: Path) -> Tuple[int, int]:
+
+def sanitize_html_like_resources(tree: ET.ElementTree, base_folder: Path) -> Tuple[int, int]:
     """
-    Ensure every webcontent resource points to a real, non-empty HTML file.
-    - If href is missing -> remove the resource and prune references.
-    - If href file is missing or empty/whitespace -> create a small placeholder HTML and repoint.
-    Returns (removed_count, patched_count).  NEVER returns None.
+    Ensure every page-like resource points to a non-empty HTML file.
+    Page-like if:
+      • resource@href ends with .html/.htm (case-insensitive), OR
+      • href resolves to a DIRECTORY, OR
+      • resource@type contains 'webcontent' or 'learning-application-resource'
+    If missing/empty/dir/non-HTML, create a placeholder and repoint.
+    If there is no href anywhere, remove the resource.
+    Returns (removed_count, patched_count).
     """
+    print("[DEBUG] entered sanitize_html_like_resources")
     root = tree.getroot()
     resources_parent = root.find('.//{*}resources')
     if resources_parent is None:
+        print("[DEBUG] sanitize_html_like_resources: no <resources> node")
         return (0, 0)
 
     removed, patched = 0, 0
-    removed_ids: Set[str] = set()
 
-    def prune_refs(to_remove: Set[str]) -> None:
-        # prune <item> in organizations
-        for org in root.findall('.//{*}organization'):
-            for parent in list(org.iter()):
-                for child in list(parent):
-                    if child.tag.endswith('item') and (child.get('identifierref') in to_remove):
-                        parent.remove(child)
-        # prune <dependency>
-        for res in root.findall('.//{*}resource'):
-            for dep in list(res.findall('{*}dependency')):
-                if dep.get('identifierref') in to_remove:
-                    res.remove(dep)
-
-    # Process each resource
-    for res in list(resources_parent.findall('{*}resource')):
+    def _is_page_like(res: ET.Element) -> bool:
         rtype = (res.get('type') or '').lower()
+        href = (res.get('href') or '').strip()
+        looks_html_href = href.lower().endswith(('.html', '.htm'))
+        return looks_html_href or ('webcontent' in rtype) or ('learning-application-resource' in rtype)
 
-        # Common Canvas/CC 1.1 shapes that Moodle maps to mod_resource (HTML page)
-        is_webcontent = (
-            'webcontent' in rtype
-            or 'learning-application-resource' in rtype
-            or rtype == 'imscc_xmlv1p1/learning-application-resource'
-            or rtype == 'associatedcontent/imscc_xmlv1p1/learning-application-resource'
-            or rtype == 'associatedcontent/imscc_xmlv1p1/webcontent'
+    def _first_href(res: ET.Element) -> str:
+        href = (res.get('href') or '').strip()
+        if href:
+            return href
+        f = res.find('{*}file')
+        if f is not None and (f.get('href') or '').strip():
+            return (f.get('href') or '').strip()
+        return ''
+
+    def _write_placeholder_html(path: Path, title: str):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"<html><body><h1>{title}</h1>"
+            f"<p>Placeholder content generated during downgrade.</p></body></html>",
+            encoding="utf-8"
         )
-        if not is_webcontent:
+
+    def _point_res_to(res: ET.Element, rel_href: str):
+        # Set primary href; ensure a matching <file href="..."> exists (Canvas/Moodle are happiest this way)
+        res.set('href', rel_href)
+        file_el = res.find('{*}file')
+        if file_el is None:
+            file_el = ET.SubElement(res, '{http://www.imsglobal.org/xsd/imscp_v1p1}file')
+        file_el.set('href', rel_href)
+
+    # Iterate defensively over a copy
+    for res in list(root.findall('.//{*}resource')):
+        if not _is_page_like(res):
             continue
 
-        rid  = res.get('identifier') or 'UNKNOWN_RESOURCE_ID'
-        href = res.get('href')
+        href = _first_href(res)
+        rid = res.get('identifier') or '(unknown)'
 
+        # No href anywhere → remove resource to avoid Moodle loadHTML("") crash
         if not href:
-            # No target at all → remove
             resources_parent.remove(res)
-            removed_ids.add(rid)
             removed += 1
+            print(f"[MANIFEST] html fix: removed page-like resource with no href (id={rid})")
             continue
 
         target = (base_folder / href)
-        data = ''
-        if target.exists():
-            try:
-                data = target.read_text(encoding='utf-8', errors='ignore')
-            except Exception:
-                data = ''
+        # Directory or missing file → write placeholder & repoint (keep structure stable)
+        if (not target.exists()) or target.is_dir():
+            placeholder_rel = Path(href).with_suffix('.html')
+            placeholder_path = (base_folder / placeholder_rel)
+            _write_placeholder_html(placeholder_path, f"Resource {rid}")
+            _point_res_to(res, str(placeholder_rel))
+            patched += 1
+            print(f"[MANIFEST] html fix: wrote placeholder for {rid} -> {placeholder_rel}")
+            continue
 
-        if (not target.exists()) or (len(data.strip()) == 0):
-            # create a minimal placeholder and repoint if needed
-            dst = target
-            try:
-                if not target.parent.exists():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
-
-            # if target path is a folder or non-HTML, park under a safe path
-            if target.is_dir() or target.suffix.lower() not in {'.html', '.htm'}:
-                dst = base_folder / f"{rid}_placeholder.html"
-                res.set('href', dst.relative_to(base_folder).as_posix())
-
-            placeholder = (
-                "<!doctype html><html><head><meta charset='utf-8'>"
-                "<title>Content placeholder</title></head>"
-                "<body><p>This content was empty or missing in the source cartridge.</p></body></html>"
+        # File exists but clearly non-HTML? (e.g., no .html/.htm extension)
+        if not href.lower().endswith(('.html', '.htm')):
+            # Keep original file, create sidecar HTML that links to it, then point to the HTML
+            sidecar_rel = Path(href).with_suffix('.html')
+            sidecar_path = (base_folder / sidecar_rel)
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            sidecar_path.write_text(
+                f"<html><body><h1>Resource {rid}</h1>"
+                f"<p>This item referenced a non-HTML file: <code>{href}</code>.</p>"
+                f"</body></html>",
+                encoding='utf-8'
             )
-            print(f"[MANIFEST] webcontent fix: {rid} -> {res.get('href') or href} (creating placeholder)")
-            try:
-                dst.write_text(placeholder, encoding='utf-8')
-                patched += 1
-            except Exception:
-                # If we can’t write, last resort: remove the resource
-                resources_parent.remove(res)
-                removed_ids.add(rid)
-                removed += 1
+            _point_res_to(res, str(sidecar_rel))
+            patched += 1
+            print(f"[MANIFEST] html fix: added sidecar HTML for {rid} -> {sidecar_rel}")
 
-    if removed_ids:
-        prune_refs(removed_ids)
-
+    print(f"[DEBUG] exiting sanitize_html_like_resources removed={removed}, patched={patched}")
     return (removed, patched)
 
 
 def audit_html_resources(tree: ET.ElementTree, base_folder: Path) -> None:
+    """
+    Report any resource whose primary href points to .html/.htm but is missing/empty.
+    Independent of resource@type.
+    """
     root = tree.getroot()
     offenders = []
+
+    def first_href(res: ET.Element) -> Optional[str]:
+        href = res.get('href')
+        if href:
+            return href
+        f = res.find('{*}file')
+        if f is not None and f.get('href'):
+            return f.get('href')
+        return None
+
     for res in root.findall('.//{*}resource'):
-        rtype = (res.get('type') or '').lower()
-        href  = res.get('href') or ''
+        rid  = res.get('identifier') or '?'
+        href = first_href(res)
         if not href:
+            # other checks will remove; but note as 'missing href'
+            offenders.append((rid, '(no href)', 'missing-href'))
             continue
-        # Only HTML-like targets
         if not href.lower().endswith(('.html', '.htm')):
             continue
+
         p = (base_folder / href)
-        if not p.exists():
-            offenders.append((res.get('identifier','?'), href, 'missing'))
+        if not p.exists() or not p.is_file():
+            offenders.append((rid, href, 'missing'))
             continue
         try:
             data = p.read_text(encoding='utf-8', errors='ignore')
         except Exception:
             data = ''
         if len(data.strip()) == 0:
-            offenders.append((res.get('identifier','?'), href, 'empty'))
+            offenders.append((rid, href, 'empty'))
+
     if offenders:
-        print("[AUDIT] HTML resource files that are missing/empty:")
-        for rid, href, why in offenders[:50]:
+        print("[AUDIT] HTML-like resource files that are missing/empty:")
+        for rid, href, why in offenders[:100]:
             print(f"  - {rid}: {href} ({why})")
+
 
 
 def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool = False, exclude_kinds: Optional[Set[str]] = None) -> Path:
@@ -1393,14 +1413,13 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
         save_manifest(tree, manifest_path)
         print(f"[MANIFEST] removed empty QTI assessments: {removed_empty}")
 
-    # 11e) sanitize webcontent (prevents DOMDocument->loadHTML on empty)
-    _res_wc = sanitize_webcontent_resources(tree, tmp)
-    wc_removed, wc_patched = _res_wc if isinstance(_res_wc, tuple) else (0, 0)
-
+    # 11e) sanitize HTML-like resources (prevents DOMDocument->loadHTML on empty)
+    wc_removed, wc_patched = sanitize_html_like_resources(tree, tmp)
     if wc_removed or wc_patched:
         save_manifest(tree, manifest_path)
-        print(f"[MANIFEST] webcontent sanitized: removed={wc_removed}, patched={wc_patched}")
+        print(f"[MANIFEST] html-like sanitized: removed={wc_removed}, patched={wc_patched}")
     audit_html_resources(tree, tmp)
+
 
     # 12) Patch descriptor XMLs to reference v1p1 schemas instead of v1p2
     patch_descriptor_xmls(tmp, log)
@@ -1418,6 +1437,122 @@ def process_cartridge(input_zip: Path, output_dir: Path, tf_to_mc_fallback: bool
     # 13B) Sanity check: ensure no v1p3/v1p2 URIs remain
     manifest_text = (tmp / 'imsmanifest.xml').read_text(encoding='utf-8', errors='ignore')
     assert_no_v13_v12_uris(manifest_text)
+    
+    # 13C) FINAL AUDIT (before rezip)
+    dirty = False
+    final_missing = []
+
+    resources_root = tree.getroot().find('.//{*}resources')
+
+    for res in list(tree.getroot().findall('.//{*}resource')):
+        href = (res.get('href') or '').strip()
+        rid = res.get('identifier') or '(unknown)'
+
+        if not href:
+            # Remove completely href-less resources
+            if resources_root is not None:
+                resources_root.remove(res)
+                dirty = True
+                print(f"[FINAL AUDIT] Removed resource lacking href (id={rid})")
+            continue
+
+        tgt = (tmp / href)
+
+        # Flag anything that is HTML-like OR any directory target
+        is_htmlish = href.lower().endswith(('.html', '.htm'))
+        is_dir_or_missing = (not tgt.exists()) or tgt.is_dir()
+
+        if (is_htmlish and is_dir_or_missing) or tgt.is_dir():
+            final_missing.append((rid, href))
+
+    if final_missing:
+        print(f"[FINAL AUDIT] Missing/invalid targets: {len(final_missing)}")
+        for rid, href in final_missing:
+            print(f"  - {rid}: {href}")
+
+        for rid, href in final_missing:
+            res = tree.find(f".//{{*}}resource[@identifier='{rid}']")
+            if res is None:
+                continue
+
+            # Build a POSIX placeholder href (forward slashes)
+            raw_rel = Path(href).with_suffix('.html')
+            placeholder_rel = "/".join(raw_rel.parts)  # ensure POSIX separators
+            placeholder_path = tmp / placeholder_rel
+
+            placeholder_path.parent.mkdir(parents=True, exist_ok=True)
+            placeholder_path.write_text(
+                f"<html><body><h1>Resource {rid}</h1>"
+                f"<p>Auto-generated placeholder for missing or invalid target: "
+                f"<code>{href}</code>.</p></body></html>",
+                encoding='utf-8'
+            )
+
+            # Point resource to placeholder and REPLACE file children to avoid stale refs
+            res.set('href', placeholder_rel)
+            for f in list(res.findall('{*}file')):
+                res.remove(f)
+            ET.SubElement(res, '{http://www.imsglobal.org/xsd/imscp_v1p1}file').set('href', placeholder_rel)
+
+            print(f"[FINAL AUDIT] Patched {rid} -> {placeholder_rel}")
+            dirty = True
+
+    if dirty:
+        save_manifest(tree, manifest_path)
+    
+    # 13D) Prune <item> nodes whose identifierref points to a missing <resource>
+    def prune_items_with_missing_resources(tree: ET.ElementTree) -> tuple[int, int, int]:
+        root = tree.getroot()
+        resources = {r.get("identifier") for r in root.findall(".//{*}resource") if r.get("identifier")}
+        removed_items = 0
+        removed_empty_containers = 0
+
+        # Helper: remove child from its parent (xml.etree has no getparent())
+        def _remove_child(parent_path: str, child):
+            parent = None
+            # Search both organizations and items as potential parents
+            for p in root.findall(parent_path):
+                for c in list(p):
+                    if c is child:
+                        parent = p
+                        p.remove(c)
+                        return parent
+            return None
+
+        # 1) Remove dangling items
+        for itm in list(root.findall(".//{*}item")):
+            ref = itm.get("identifierref")
+            if ref and ref not in resources:
+                _remove_child(".//{*}item|.//{*}organization", itm)
+                removed_items += 1
+
+        # 2) Remove empty item containers (items with no child items and no identifierref)
+        changed = True
+        while changed:
+            changed = False
+            for itm in list(root.findall(".//{*}item")):
+                has_children = any(child.tag.endswith("item") for child in itm)
+                has_ref = bool(itm.get("identifierref"))
+                if (not has_children) and (not has_ref):
+                    parent = _remove_child(".//{*}item|.//{*}organization", itm)
+                    if parent is not None:
+                        removed_empty_containers += 1
+                        changed = True
+
+        # 3) Remove empty <organization> nodes
+        for org in list(root.findall(".//{*}organization")):
+            if not any(True for _ in org.findall(".//{*}item")):
+                parent = _remove_child(".//{*}organizations", org)
+                if parent is not None:
+                    removed_empty_containers += 1
+
+        return removed_items, removed_empty_containers, len(resources)
+
+    pruned_items, pruned_containers, _ = prune_items_with_missing_resources(tree)
+    if pruned_items or pruned_containers:
+        print(f"[ORG] removed items referencing missing resources: {pruned_items}")
+        print(f"[ORG] removed empty containers/organizations: {pruned_containers}")
+        save_manifest(tree, manifest_path)
 
     # 14) Write output zip (.imscc)
     out_name = input_zip.stem + '-cc11.imscc'
