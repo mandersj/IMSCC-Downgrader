@@ -34,19 +34,6 @@ This script’s goal was to:
 
 ---
 
-## 🧰 Final Design (v1.4.5)
-
-Adds an optional flag to remove specific resources from the manifest:
-
-```bash
---exclude-href <path or suffix>
-
-## Usage Example
-python3 DowngradeIMSCC.py \
-  --input course.imscc \
-  --output downgraded/ \
-  --exclude-href web_resources/Uploaded%20Media/EItAcdPP-kk%281%29.jpg
-
 ## 🔎 Helper Scripts (`probe_*.py`)
 
 | File | Purpose |
@@ -56,8 +43,16 @@ python3 DowngradeIMSCC.py \
 | **probe_encode_v2.py** | Flags malformed or double-encoded file names (`%2520`, `%20%20`, etc.) |
 | **probe_mismatch.py** | Compares manifest hrefs vs actual filenames for canonicalization errors |
 | **probe_verifyEachResource.py** | Walks through all `<resource>` elements to confirm file existence and type validity |
+---
+## 🧰 v1.4.5 Usage Example
+Adds an optional flag to remove specific resources from the manifest:
+```bash
+--exclude-href <path or suffix>
 
-
+python3 DowngradeIMSCC.py \
+  --input course.imscc \
+  --output downgraded/ \
+  --exclude-href web_resources/Uploaded%20Media/EItAcdPP-kk%281%29.jpg
 ---
 ## 🧩 Why It Failed
 
