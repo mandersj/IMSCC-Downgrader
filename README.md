@@ -44,7 +44,7 @@ This script’s goal was to:
 | **probe_mismatch.py** | Compares manifest hrefs vs actual filenames for canonicalization errors |
 | **probe_verifyEachResource.py** | Walks through all `<resource>` elements to confirm file existence and type validity |
 ---
-## 🧰 v1.4.5 Usage Example
+### 🧰 v1.4.5 Usage Example
 
 python3 DowngradeIMSCC.py \
   --input course.imscc \
@@ -57,11 +57,9 @@ Adds an optional flag to remove specific resources from the manifest:
 ---
 # 🧩 Why It Failed
 
-Despite dozens of successful conversions, **Moodle’s importer applies a single URL decode**, while Canvas exports inconsistently encode filenames.  
-This led to one unsolvable mismatch: files with parentheses like `EItAcdPP-kk(1).jpg` vs encoded `%281%29`.
+Despite dozens of successful conversions, **Moodle’s importer applies a single URL decode**, while Canvas exports inconsistently encode filenames. This led to one unsolvable mismatch: files with parentheses like `EItAcdPP-kk(1).jpg` vs encoded `%281%29`.
 
-The Moodle Dev Team clarified:
-
+Moodle clarified:
 > Moodle decodes once. The manifest can use `%28`/`%29`, but the actual file on disk must use literal `(` `)`.  
 > Do **not** include both versions or double-encode.
 
@@ -70,7 +68,7 @@ After multiple attempts to reconcile Canvas’ double-encoding, we chose a pragm
 ---
 # 🧪 Lessons Learned
 
-- **LMS vendors often deviate from IMS specs — imports succeed based on implementation details, not schema compliance.
-- **Canvas exports can contain both encoded and decoded file paths. Moodle does not handle both.
-- **Over-encoding filenames (%28%29, %2528%2529) breaks Moodle’s single-decode rule.
-- **Full cross-LMS automation requires knowledge of internal import logic, which is effectively a black box.
+- LMS vendors often deviate from IMS specs — imports succeed based on implementation details, not schema compliance.
+- Canvas exports can contain both encoded and decoded file paths. Moodle does not handle both.
+- Over-encoding filenames (%28%29, %2528%2529) breaks Moodle’s single-decode rule.
+- Full cross-LMS automation requires knowledge of internal import logic, which is effectively a black box.
