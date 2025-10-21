@@ -51,8 +51,7 @@ python3 DowngradeIMSCC.py \
   --output downgraded/ \
   --exclude-href web_resources/Uploaded%20Media/EItAcdPP-kk%281%29.jpg
 
-  Adds an optional flag to remove specific resources from the manifest:
-```bash
+Adds an optional flag to remove specific resources from the manifest:
 --exclude-href <path or suffix>
 
 ---
