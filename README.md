@@ -3,11 +3,9 @@
 A Python utility that attempts to **downgrade IMS Common Cartridge 1.2 exports (Canvas)** to **1.1 format (Moodle)**.  
 The project explored the boundary between strict IMS standards, real-world LMS quirks, and automated content repair — but ultimately, it didn’t achieve full compatibility.
 
-🚧 Status
-
-Release: v1.4.5
-Outcome: partial success – consistent downgrades for most courses, but failed full automation due to encoding edge cases.
-Current direction: manual review and selective exclusion are recommended before Moodle import.
+🚧 **Status Release: v1.4.5 | v1.4.3 has the most functions enabled**
+**Outcome:** partial success – consistent downgrades for most courses, but failed full automation due to encoding edge cases.
+**Current direction:** manual review and selective exclusion are recommended before Moodle import.
 
 ---
 
@@ -55,7 +53,7 @@ Adds an optional flag to remove specific resources from the manifest:
 --exclude-href <path or suffix>
 
 ---
-# 🧩 Why It Failed
+## 🧩 Why It Failed
 
 Despite dozens of successful conversions, **Moodle’s importer applies a single URL decode**, while Canvas exports inconsistently encode filenames. This led to one unsolvable mismatch: files with parentheses like `EItAcdPP-kk(1).jpg` vs encoded `%281%29`.
 
@@ -66,7 +64,7 @@ Moodle clarified:
 After multiple attempts to reconcile Canvas’ double-encoding, we chose a pragmatic approach: **exclude the problematic file** instead of overengineering a brittle fix.
 
 ---
-# 🧪 Lessons Learned
+## 🧪 Lessons Learned
 
 - LMS vendors often deviate from IMS specs — imports succeed based on implementation details, not schema compliance.
 - Canvas exports can contain both encoded and decoded file paths. Moodle does not handle both.
