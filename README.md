@@ -45,16 +45,18 @@ This script’s goal was to:
 | **probe_verifyEachResource.py** | Walks through all `<resource>` elements to confirm file existence and type validity |
 ---
 ## 🧰 v1.4.5 Usage Example
-Adds an optional flag to remove specific resources from the manifest:
-```bash
---exclude-href <path or suffix>
 
 python3 DowngradeIMSCC.py \
   --input course.imscc \
   --output downgraded/ \
   --exclude-href web_resources/Uploaded%20Media/EItAcdPP-kk%281%29.jpg
+
+  Adds an optional flag to remove specific resources from the manifest:
+```bash
+--exclude-href <path or suffix>
+
 ---
-## 🧩 Why It Failed
+# 🧩 Why It Failed
 
 Despite dozens of successful conversions, **Moodle’s importer applies a single URL decode**, while Canvas exports inconsistently encode filenames.  
 This led to one unsolvable mismatch: files with parentheses like `EItAcdPP-kk(1).jpg` vs encoded `%281%29`.
@@ -67,7 +69,7 @@ The Moodle Dev Team clarified:
 After multiple attempts to reconcile Canvas’ double-encoding, we chose a pragmatic approach: **exclude the problematic file** instead of overengineering a brittle fix.
 
 ---
-## 🧪 Lessons Learned
+# 🧪 Lessons Learned
 
 - **LMS vendors often deviate from IMS specs — imports succeed based on implementation details, not schema compliance.
 - **Canvas exports can contain both encoded and decoded file paths. Moodle does not handle both.
